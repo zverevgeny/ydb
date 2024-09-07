@@ -9,33 +9,38 @@ namespace NKikimr::NColumnShard::NSubscriber {
 
 class ISubscriber {
 public:
-    virtual void OnEvent(const std::shared_ptr<ISubscriptionEvent>& ev) = 0;
-
+    enum class EEventHandlingResult {
+        //The order is important for result compostion
+        Finished,
+        StillWaiting,
+        EventSetChanged, //implied StillWaiting for new event types
+    };
+    virtual EEventHandlingResult OnEvent(const std::shared_ptr<ISubscriptionEvent>& ev) = 0;
     virtual std::set<EEventType> GetEventTypes() const = 0;
     virtual bool IsFinished() const = 0;
-
     virtual ~ISubscriber() = default;
 };
 
 class TSubscriberBase: public ISubscriber {
 protected:
-    virtual void DoOnEvent(const NSubscriber::TEventTablesErased&) {};
-    virtual void DoOnEvent(const NSubscriber::TEventTransactionCompleted&) {};
-    virtual void DoOnEvent(const NSubscriber::TEventWritesCompleted&) {};
+    virtual EEventHandlingResult DoOnEvent(const NSubscriber::TEventTablesErased&) { return EEventHandlingResult::StillWaiting; };
+    virtual EEventHandlingResult DoOnEvent(const NSubscriber::TEventTransactionCompleted&){ return EEventHandlingResult::StillWaiting; };
+    virtual EEventHandlingResult DoOnEvent(const NSubscriber::TEventWritesCompleted&) { return EEventHandlingResult::StillWaiting; };
 public:
-    void OnEvent(const std::shared_ptr<ISubscriptionEvent>& ev) override {
+    EEventHandlingResult OnEvent(const std::shared_ptr<ISubscriptionEvent>& ev) override {
         switch(ev->GetType()) {
             case EEventType::Undefined:
-                break;//AFL_VERIFY(false);
-            case EEventType::TablesErased:
-                DoOnEvent(static_cast<const NSubscriber::TEventTablesErased&>(*ev.get()));
-                break;
-            case EEventType::TransactionCompleted:
-                DoOnEvent(static_cast<const NSubscriber::TEventTransactionCompleted&>(*ev.get()));
-                break;
-            case EEventType::WritesCompleted:
-                DoOnEvent(static_cast<const NSubscriber::TEventWritesCompleted&>(*ev.get()));
-                break;
+                AFL_VERIFY(false);
+            case EEventType::TablesErased: //delete me
+                return DoOnEvent(static_cast<const NSubscriber::TEventTablesErased&>(*ev.get()));
+            case EEventType::TransactionCompleted: //delete me
+                return DoOnEvent(static_cast<const NSubscriber::TEventTransactionCompleted&>(*ev.get()));
+            case EEventType::WritesCompleted: //delete me
+                return DoOnEvent(static_cast<const NSubscriber::TEventWritesCompleted&>(*ev.get()));
+            case EEventType::IndexationCompleted:
+                return DoOnEvent(static_cast<const NSubscriber::TEventWritesCompleted&>(*ev.get())); //TODO fixme
+            case EEventType::DataLockAccuired:
+                return EEventHandlingResult::StillWaiting; //FIX me
         }
     }
 };

@@ -348,13 +348,26 @@ std::shared_ptr<TTxController::ITransactionOperator> TTxController::StartPropose
             return UpdateTxSourceInfo(txOperator->GetTxInfo(), txc);
         }
     } else {
-        if (txOperator->StartProposeOnExecute(Owner, txc)) {
+        if (auto startProposeResult = txOperator->StartProposeOnExecute(Owner, txc)) {
+            auto waitClaim = startProposeResult.WaitClaim;
+            const auto isReady = startProposeResult->Is();
+            if (!isReady) {
+                if (startProposeResult->IsRejectable()) {
+                    AFL_ERROR(NKikimrServices::TX_COLUMNSHARD)("error", "problem on start")(
+                        "message", txOperator->GetProposeStartInfoVerified().GetStatusMessage());        
+                }
+            }
             if (txOperator->TxWithDeadline()) {
                 RegisterTxWithDeadline(txOperator, txBody, txc);
             } else {
                 RegisterTx(txOperator, txBody, txc);
             }
             AFL_DEBUG(NKikimrServices::TX_COLUMNSHARD)("event", "registered");
+            if (!waitClaim.IsReady()) {
+                self.Subscribers.Register(startProposeResult.WaitClaim, [](){
+                    new asdfsfdf();
+                })
+            }
         } else {
             AFL_ERROR(NKikimrServices::TX_COLUMNSHARD)("error", "problem on start")(
                 "message", txOperator->GetProposeStartInfoVerified().GetStatusMessage());

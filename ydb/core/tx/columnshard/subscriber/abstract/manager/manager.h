@@ -60,9 +60,16 @@ public:
         }
         std::vector<TSharedPtrHashContainer> toRemove;
         for (auto&& i : it->second) {
-            i->OnEvent(ev);
-            if (i->IsFinished()) {
-                toRemove.emplace_back(i);
+            auto r = i->OnEvent(ev);
+            switch (r) {
+                case ISubscriber::EEventHandlingResult::StillWaiting:
+                    break;
+                case ISubscriber::EEventHandlingResult::Finished:
+                    toRemove.emplace_back(i);
+                    break;
+                case ISubscriber::EEventHandlingResult::EventSetChanged:
+                    //TODO implement me
+                    break;
             }
         }
         for (auto&& i : toRemove) {

@@ -2,6 +2,8 @@
 #include <ydb/core/tx/columnshard/subscriber/abstract/events/event.h>
 #include <util/generic/hash_set.h>
 
+
+//TODO remove me. Waiting for table erased is implemented via Creation lock category on pathid
 namespace NKikimr::NColumnShard::NSubscriber {
 class TEventTablesErased: public ISubscriptionEvent {
 private:

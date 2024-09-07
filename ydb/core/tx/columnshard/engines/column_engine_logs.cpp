@@ -352,7 +352,8 @@ std::shared_ptr<TCleanupPortionsColumnEngineChanges> TColumnEngineForLogs::Start
         }
 
         for (auto& [portion, info] : g->GetPortions()) {
-            if (dataLocksManager->IsLocked(*info)) {
+            auto lock = dataLocksManager->TryLock(*info, NDataLocks::ELockType::Shared, {NDataLocks::ELockCategory::BackgroundTasks});
+            if (!lock) {
                 ++skipLocked;
                 continue;
             }
@@ -377,7 +378,8 @@ std::shared_ptr<TCleanupPortionsColumnEngineChanges> TColumnEngineForLogs::Start
             break;
         }
         for (ui32 i = 0; i < it->second.size();) {
-            if (dataLocksManager->IsLocked(it->second[i])) {
+            auto lock = dataLocksManager->TryLock(it->second[i], NDataLocks::ELockType::Shared, {NDataLocks::ELockCategory::BackgroundTasks});
+            if (!lock) {
                 ++skipLocked;
                 ++i;
                 continue;

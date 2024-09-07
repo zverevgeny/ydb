@@ -25,9 +25,9 @@ bool TCommonSession::TryStart(const NColumnShard::TColumnShard& shard) {
         auto& portionsVector = portionsByPath[i];
         const auto& g = index.GetGranuleVerified(i);
         for (auto&& p : g.GetPortionsOlderThenSnapshot(GetSnapshotBarrier())) {
-            if (shard.GetDataLocksManager()->IsLocked(*p.second, { "sharing_session:" + GetSessionId() })) {
-                return false;
-            }
+            // if (shard.GetDataLocksManager()->IsLocked(*p.second, { "sharing_session:" + GetSessionId() })) {
+            //     return false;
+            // }
             portionsVector.emplace_back(p.second);
         }
     }
@@ -46,8 +46,8 @@ void TCommonSession::PrepareToStart(const NColumnShard::TColumnShard& shard) {
     AFL_VERIFY(State == EState::Created);
     State = EState::Prepared;
     AFL_VERIFY(!LockGuard);
-    LockGuard = shard.GetDataLocksManager()->RegisterLock<NDataLocks::TSnapshotLock>("sharing_session:" + GetSessionId(),
-        TransferContext.GetSnapshotBarrierVerified(), GetPathIdsForStart(), true);
+    // LockGuard = shard.GetDataLocksManager()->RegisterLock<NDataLocks::TSnapshotLock>("sharing_session:" + GetSessionId(),
+    //     TransferContext.GetSnapshotBarrierVerified(), GetPathIdsForStart(), true);
     shard.GetSharingSessionsManager()->StartSharingSession();
 }
 

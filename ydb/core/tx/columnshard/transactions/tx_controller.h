@@ -5,6 +5,7 @@
 #include <ydb/core/tx/columnshard/counters/columnshard.h>
 #include <ydb/core/tx/data_events/events.h>
 #include <ydb/core/tx/message_seqno.h>
+#include <ydb/core/tx/columnshard/data_locks/manager/manager.h>
 
 namespace NKikimr::NOlap::NTxInteractions {
 class TManager;
@@ -199,6 +200,7 @@ public:
     protected:
         TTxInfo TxInfo;
         YDB_READONLY_DEF(std::optional<TTxController::TProposeResult>, ProposeStartInfo);
+        NOlap::NDataLocks::TManager::TGuard DataLock;
         std::optional<EStatus> Status = EStatus::Created;
 
     private:

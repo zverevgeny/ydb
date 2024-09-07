@@ -215,24 +215,24 @@ public:
     bool IsLocked(const std::shared_ptr<NDataLocks::TManager>& dataLocksManager) const {
         for (auto&& f : Futures) {
             for (auto&& p : f.second) {
-                if (auto lockInfo = dataLocksManager->IsLocked(*p.second)) {
-                    AFL_WARN(NKikimrServices::TX_COLUMNSHARD)("event", "optimization_locked")("reason", *lockInfo);
+                if (auto lock = dataLocksManager->TryLock(*p.second, NDataLocks::ELockType::Shared, {NDataLocks::ELockCategory::BackgroundTasks}); !lock) {
+                    AFL_WARN(NKikimrServices::TX_COLUMNSHARD)("event", "optimization_locked")("reason", "locked");
                     return true;
                 }
             }
         }
-        for (auto&& i : PreActuals) {
-            if (auto lockInfo = dataLocksManager->IsLocked(*i.second)) {
-                AFL_WARN(NKikimrServices::TX_COLUMNSHARD)("event", "optimization_locked")("reason", *lockInfo);
-                return true;
-            }
-        }
-        for (auto&& i : Actuals) {
-            if (auto lockInfo = dataLocksManager->IsLocked(*i.second)) {
-                AFL_WARN(NKikimrServices::TX_COLUMNSHARD)("event", "optimization_locked")("reason", *lockInfo);
-                return true;
-            }
-        }
+        // for (auto&& i : PreActuals) {
+        //     if (auto lockInfo = dataLocksManager->IsLocked(*i.second)) {
+        //         AFL_WARN(NKikimrServices::TX_COLUMNSHARD)("event", "optimization_locked")("reason", *lockInfo);
+        //         return true;
+        //     }
+        // }
+        // for (auto&& i : Actuals) {
+        //     if (auto lockInfo = dataLocksManager->IsLocked(*i.second)) {
+        //         AFL_WARN(NKikimrServices::TX_COLUMNSHARD)("event", "optimization_locked")("reason", *lockInfo);
+        //         return true;
+        //     }
+        // }
         return false;
     }
 
@@ -746,10 +746,10 @@ public:
 
     bool IsLocked(const std::shared_ptr<NDataLocks::TManager>& dataLocksManager) const {
         if (MainPortion) {
-            if (auto lockInfo = dataLocksManager->IsLocked(*MainPortion)) {
-                AFL_WARN(NKikimrServices::TX_COLUMNSHARD)("event", "optimization_locked")("reason", *lockInfo);
-                return true;
-            }
+            // if (auto lockInfo = dataLocksManager->IsLocked(*MainPortion)) {
+            //     AFL_WARN(NKikimrServices::TX_COLUMNSHARD)("event", "optimization_locked")("reason", *lockInfo);
+            //     return true;
+            // }
         }
         return Others.IsLocked(dataLocksManager);
     }
@@ -885,10 +885,11 @@ public:
         ui64 size = 0;
         for (auto&& i : portions) {
             size += i->GetTotalBlobBytes();
-            if (locksManager->IsLocked(*i)) {
-                AFL_DEBUG(NKikimrServices::TX_COLUMNSHARD)("info", Others.DebugString())("event", "skip_optimization")("reason", "busy");
-                return nullptr;
-            }
+            Y_UNUSED(locksManager);
+            // if (locksManager->IsLocked(*i)) {
+            //     AFL_DEBUG(NKikimrServices::TX_COLUMNSHARD)("info", Others.DebugString())("event", "skip_optimization")("reason", "busy");
+            //     return nullptr;
+            // }
         }
         AFL_INFO(NKikimrServices::TX_COLUMNSHARD)("stop_instant", stopInstant)("size", size)("next", NextBorder ? NextBorder->DebugString() : "")
             ("count", portions.size())("info", Others.DebugString())("event", "start_optimization")("stop_point", stopPoint ? stopPoint->DebugString() : "")

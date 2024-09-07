@@ -16,11 +16,12 @@ public:
     virtual std::set<NSubscriber::EEventType> GetEventTypes() const override {
         return { NSubscriber::EEventType::TablesErased };
     }
-    void DoOnEvent(const NSubscriber::TEventTablesErased& ev) override {
+    EEventHandlingResult DoOnEvent(const NSubscriber::TEventTablesErased& ev) override {
         for(const auto& pathId: ev.GetPathIds()) {
             WaitTables.erase(pathId);
         }
         AFL_NOTICE(NKikimrServices::TX_COLUMNSHARD)("event", "on_event")("remained", JoinSeq(",", WaitTables));
+        return EEventHandlingResult::StillWaiting;
     }
 
     virtual bool IsFinished() const override {
@@ -44,8 +45,9 @@ public:
     bool IsFinished() const override {
         return WriteIds.empty();
     }
-    void DoOnEvent(const NSubscriber::TEventWritesCompleted& ev) override {
+    EEventHandlingResult DoOnEvent(const NSubscriber::TEventWritesCompleted& ev) override {
         WriteIds.erase(ev.GetWriteId());
+        return EEventHandlingResult::StillWaiting;
     }
 };
 
@@ -61,10 +63,14 @@ public:
     bool IsFinished() const override {
         return TxIds.empty();
     }
-    void DoOnEvent(const NSubscriber::TEventTransactionCompleted& ev) override {
+    EEventHandlingResult DoOnEvent(const NSubscriber::TEventTransactionCompleted& ev) override {
         TxIds.erase(ev.GetTxId());
+        return EEventHandlingResult::StillWaiting;
     }
 };
+
+
+
 
 TTxController::TProposeResult TSchemaTransactionOperator::DoStartProposeOnExecute(TColumnShard& owner, NTabletFlatExecutor::TTransactionContext& txc) {
     auto seqNo = SeqNoFromProto(SchemaTxBody.GetSeqNo());
@@ -225,10 +231,14 @@ void TSchemaTransactionOperator::DoOnTabletInit(TColumnShard& owner) {
     const ui64 srcPathId = 3;
     const ui64 dstPathId = 30;
     owner.Subscribers->RegisterSubscriber(
-        std::make_shared<NSubscriber::TCompositeSubscriber>(std::initializer_list<std::shared_ptr< NSubscriber::ISubscriber>>{
-                std::make_shared<TWaitEraseTablesTxSubscriber>(THashSet<ui64>{dstPathId}),
+        std::make_shared<NSubscriber::TParallelWaitSubscriber>(std::initializer_list<std::shared_ptr< NSubscriber::ISubscriber>>{
+            std::make_shared<TWaitEraseTablesTxSubscriber>(THashSet<ui64>{dstPathId}),
+            std::make_shared<NSubscriber::TSequentialWaitSubscriber>(
                 std::make_shared<TWaitTransactions>(owner.GetProgressTxController().GetTxsByPathId(srcPathId)),
-                std::make_shared<TWaitWrites>(owner.InsertTable->GetInsertedByPathId(srcPathId))
+                [&owner]() -> std::shared_ptr<NSubscriber::ISubscriber> {
+                    return std::make_shared<TWaitIndexation>(owner.InsertTable->GetInsertedByPathId(srcPathId))
+                }
+            )
         }),
         [&](){owner.Execute(new TTxFinishAsyncTransaction(owner, GetTxId()));}
     );
