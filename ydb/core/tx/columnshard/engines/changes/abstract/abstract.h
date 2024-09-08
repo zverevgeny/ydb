@@ -197,7 +197,7 @@ public:
     };
 private:
     EStage Stage = EStage::Created;
-    std::shared_ptr<NDataLocks::TManager::TGuard> LockGuard;
+    std::shared_ptr<NDataLocks::TGuard> LockGuard;
     TString AbortedReason;
 
 protected:

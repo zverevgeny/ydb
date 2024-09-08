@@ -352,10 +352,10 @@ std::shared_ptr<TCleanupPortionsColumnEngineChanges> TColumnEngineForLogs::Start
         }
 
         for (auto& [portion, info] : g->GetPortions()) {
-            if (dataLocksManager->IsLocked(*info)) {
-                ++skipLocked;
-                continue;
-            }
+            // if (dataLocksManager->IsLocked(*info)) {
+            //     ++skipLocked;
+            //     continue;
+            // }
             if (txSize + info->GetTxVolume() < txSizeLimit || changes->PortionsToDrop.empty()) {
                 txSize += info->GetTxVolume();
             } else {
@@ -377,11 +377,11 @@ std::shared_ptr<TCleanupPortionsColumnEngineChanges> TColumnEngineForLogs::Start
             break;
         }
         for (ui32 i = 0; i < it->second.size();) {
-            if (dataLocksManager->IsLocked(it->second[i])) {
-                ++skipLocked;
-                ++i;
-                continue;
-            }
+            // if (dataLocksManager->IsLocked(it->second[i])) {
+            //     ++skipLocked;
+            //     ++i;
+            //     continue;
+            // }
             const auto inserted = uniquePortions.emplace(it->second[i].GetAddress()).second;
             if (inserted) {
                 AFL_VERIFY(it->second[i].CheckForCleanup(snapshot))("p_snapshot", it->second[i].GetRemoveSnapshotOptional())("snapshot", snapshot);
@@ -575,38 +575,36 @@ void TColumnEngineForLogs::DoRegisterTable(const ui64 pathId) {
         g->RefreshScheme();
     }
 }
-
-bool TColumnEngineForLogs::ProgressMoveTableData(const ui64 srcPathId, const ui64 dstPathId, NTable::TDatabase& db) {
-    Y_UNUSED(db);
+ std::vector<std::shared_ptr<TPortionInfo>> TColumnEngineForLogs::MovePortionsOnExecute(const ui64 srcPathId, const ui64 dstPathId, NTable::TDatabase& db) {
+    std::vector<std::shared_ptr<TPortionInfo>> result;
     auto srcGranule = GranulesStorage->GetGranuleOptional(srcPathId);
     AFL_VERIFY(srcGranule);
-    const auto& srcPortions = srcGranule->GetPortions();
-    if (srcPortions.empty()) {
-        return true;
-    }
     const auto dstGranule = GranulesStorage->GetGranuleOptional(dstPathId);
     AFL_VERIFY(dstGranule);
     const size_t ChangeAtOnceLimit = 10000; //To fit max local db transaction change limit
-    size_t count = 0;
     TDbWrapper dbWrapper(db, nullptr);
-    std::vector<ui64> ids;
-    for (auto& [id, portionInfo]: srcPortions) {
+    for (auto& [id, portionInfo]: srcGranule->GetPortions()) {
         AFL_VERIFY(portionInfo->GetPathId() == srcPathId);
         portionInfo->SetPathId(dstPathId);
-        auto schemaPtr = GetVersionedIndex().GetLastSchema();
-        portionInfo->SaveToDatabase(dbWrapper, schemaPtr->GetIndexInfo().GetPKFirstColumnId(), true);
-        dstGranule->UpsertPortion(*portionInfo);
-        ids.push_back(id);
-        ++count;
-        if (count == ChangeAtOnceLimit) {
-            return false;
-        } 
-    }
-    for (const auto& id: ids) {
+        auto schema = portionInfo->GetSchema(GetVersionedIndex());
+        portionInfo->SaveToDatabase(dbWrapper, schema->GetIndexInfo().GetPKFirstColumnId(), true);
         srcGranule->ErasePortion(id);
+        result.push_back(portionInfo);
+        if (result.size() == ChangeAtOnceLimit) {
+            break;
+        }
     }
+    return result;
+}
 
-    return true;
+void TColumnEngineForLogs::MovePortionsOnComplete(const ui64 srcPathId, const ui64 dstPathId, std::vector<std::shared_ptr<TPortionInfo>>&& portions) {
+    auto srcGranule = GranulesStorage->GetGranuleOptional(srcPathId);
+    AFL_VERIFY(srcGranule);
+    const auto dstGranule = GranulesStorage->GetGranuleOptional(dstPathId);
+    AFL_VERIFY(dstGranule);
+    // for (auto&& portion: portions) {
+    //     dstGranule->UpsertPortion(*portionInfo);
+    // }
 }
 
 } // namespace NKikimr::NOlap
