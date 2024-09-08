@@ -25,9 +25,9 @@ protected:
         out << "remove=" << PortionsToRemove.size() << ";append=" << AppendedPortions.size() << ";move=" << PortionsToMove.size();
     }
 
-    virtual std::shared_ptr<NDataLocks::ILock> DoBuildDataLockImpl() const = 0;
+    virtual std::unique_ptr<NDataLocks::ILock> DoBuildDataLockImpl() const = 0;
 
-    virtual std::shared_ptr<NDataLocks::ILock> DoBuildDataLock() const override final {
+    virtual std::unique_ptr<NDataLocks::ILock> DoBuildDataLock() const override final {
         auto actLock = DoBuildDataLockImpl();
         THashSet<TPortionAddress> portions;
         for (auto&& i : PortionsToRemove) {
@@ -37,12 +37,16 @@ protected:
             AFL_VERIFY(portions.emplace(i.first).second);
         }
         if (actLock) {
-            auto selfLock = std::make_shared<NDataLocks::TListPortionsLock>(TypeString() + "::" + GetTaskIdentifier() + "::REMOVE/MOVE", portions);
-            return std::make_shared<NDataLocks::TCompositeLock>(TypeString() + "::" + GetTaskIdentifier(), std::vector<std::shared_ptr<NDataLocks::ILock>>({actLock, selfLock}));
+            auto selfLock = std::make_unique<NDataLocks::TListPortionsLock>(TypeString() + "::" + GetTaskIdentifier() + "::REMOVE/MOVE", portions);
+            std::vector<NDataLocks::ILock::TPtr> locks;
+            locks.emplace_back(std::move(actLock));
+            locks.emplace_back(std::move(selfLock));
+            return std::make_unique<NDataLocks::TCompositeLock>(TypeString() + "::" + GetTaskIdentifier(), std::move(locks));
         } else {
-            auto selfLock = std::make_shared<NDataLocks::TListPortionsLock>(TypeString() + "::" + GetTaskIdentifier(), portions);
+            auto selfLock = std::make_unique<NDataLocks::TListPortionsLock>(TypeString() + "::" + GetTaskIdentifier(), portions);
             return selfLock;
         }
+
     }
 public:
     TChangesWithAppend(const TSaverContext& saverContext, const NBlobOperations::EConsumer consumerId)

@@ -24,9 +24,9 @@ protected:
     virtual void OnAbortEmergency() override {
         NeedGranuleStatusProvide = false;
     }
-    virtual std::shared_ptr<NDataLocks::ILock> DoBuildDataLockImpl() const override {
+    virtual std::unique_ptr<NDataLocks::ILock> DoBuildDataLockImpl() const override {
         const THashSet<ui64> pathIds = { GranuleMeta->GetPathId() };
-        return std::make_shared<NDataLocks::TListTablesLock>(TypeString() + "::" + GetTaskIdentifier(), pathIds);
+        return std::make_unique<NDataLocks::TListTablesLock>(TypeString() + "::" + GetTaskIdentifier(), pathIds);
     }
 
 public:
