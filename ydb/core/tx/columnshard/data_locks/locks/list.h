@@ -11,21 +11,21 @@ private:
     THashSet<TPortionAddress> Portions;
     THashSet<ui64> Granules;
 protected:
-    virtual std::optional<TString> IsLocked(const TPortionInfo& portion, const TLockScope& scope) const override {
+    virtual std::optional<TString> IsLocked(const TPortionInfo& portion, const EAction action) const override {
         Y_UNUSED(scope);
         if (Portions.contains(portion.GetAddress())) {
             return GetLockName();
         }
         return {};
     }
-    virtual std::optional<TString> IsLocked(const TGranuleMeta& granule, const TLockScope& scope) const override {
+    virtual std::optional<TString> IsLocked(const TGranuleMeta& granule, const EAction action) const override {
         Y_UNUSED(scope);
         if (Granules.contains(granule.GetPathId())) {
             return GetLockName();
         }
         return {};
     }
-    virtual std::optional<TString> IsLockedTableSchema(const ui64 pathId, const TLockScope& scope) const override {
+    virtual std::optional<TString> IsLockedTableSchema(const ui64 pathId, const EAction action) const override {
         Y_UNUSED(pathId);
         Y_UNUSED(scope);
         return {};
@@ -75,8 +75,21 @@ public:
 class TListTablesLock: public ILock {
 private:
     using TBase = ILock;
-    THashSet<ui64> Tables;
+    const THashSet<ui64> Tables;
+    const NDataLocks::TLockScope scope;
+private:
 protected:
+    virtual bool IsEqualTo(ILock& other) const override {
+        if (auto& otherLock = dynamic_cast<TListTablesLock&>(other)) {
+            return Tables == other.Tables && Scope == other.Scope;
+        };
+        return false;
+    }
+    virtual bool IsCompatibleWith(ILock& other) const override {
+        if (auto& otherLock = dynamic_cast<TListTablesLock&>(other)) {
+            
+        }
+    }
     virtual std::optional<TString> IsLocked(const TPortionInfo& portion, const TLockScope&) const override {
         if (Tables.contains(portion.GetPathId())) {
             return GetLockName();
@@ -89,18 +102,18 @@ protected:
         }
         return {};
     }
-    virtual std::optional<TString> IsLockedTableSchema(const ui64 pathId, const TLockScope& scope) const override {
-        Y_UNUSED(pathId);
-        Y_UNUSED(scope);
-        return {};
+    virtual std::optional<TString> IsLockedTableSchema(const ui64 pathId, const EAction action) const override {
+        if (scope.Originator == Originator)
+        return GetLockName();
     }
     bool IsEmpty() const override {
         return Tables.empty();
     }
 public:
-    TListTablesLock(const TString& lockName, const THashSet<ui64>& tables)
+    TListTablesLock(const TString& lockName, const THashSet<ui64>& tables, const EAction action)
         : TBase(lockName)
         , Tables(tables)
+        , Scope(scope)
     {
     }
 };

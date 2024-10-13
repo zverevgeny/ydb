@@ -8,25 +8,27 @@ private:
     using TBase = ILock;
     std::vector<std::unique_ptr<ILock>> Locks;
 protected:
-    virtual std::optional<TString> IsLocked(const TPortionInfo& portion, const TLockScope& scope) const override {
+    virtual std::optional<TString> IsLocked(const TPortionInfo& portion, const EAction action) const override {
+        Y_UNUSED(action);
         for (auto&& i : Locks) {
-            if (auto lockName = i->IsLocked(portion, scope)) {
+            if (auto lockName = i->IsLocked(portion, action)) {
                 return lockName;
             }
         }
         return {};
     }
-    virtual std::optional<TString> IsLocked(const TGranuleMeta& granule, const TLockScope& scope) const override {
+    virtual std::optional<TString> IsLocked(const TGranuleMeta& granule, const EAction action) const override {
+        Y_UNUSED(action);
         for (auto&& i : Locks) {
-            if (auto lockName = i->IsLocked(granule, scope)) {
+            if (auto lockName = i->IsLocked(granule, action)) {
                 return lockName;
             }
         }
         return {};
     }
-    virtual std::optional<TString> IsLockedTableSchema(const ui64 pathId, const TLockScope& scope) const override {
+    virtual std::optional<TString> IsLockedTableSchema(const ui64 pathId, const EAction action) const override {
         Y_UNUSED(pathId);
-        Y_UNUSED(scope);
+        Y_UNUSED(action);
         return {};
     }
     bool IsEmpty() const override {
