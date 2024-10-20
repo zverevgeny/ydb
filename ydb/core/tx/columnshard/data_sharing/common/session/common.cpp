@@ -27,7 +27,7 @@ bool TCommonSession::TryStart(const NColumnShard::TColumnShard& shard) {
             using namespace NDataLocks;
             if (shard.GetDataLocksManager()->IsLocked(
                 *p.second,
-                TLockScope{.Action = EAction::Modify, .Originator = EOriginator::Bg},
+                EAction::Modify,
                 LockGuard))
             {
                 return false;

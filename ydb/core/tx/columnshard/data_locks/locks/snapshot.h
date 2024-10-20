@@ -11,8 +11,8 @@ private:
     const TSnapshot SnapshotBarrier;
     const THashSet<ui64> PathIds;
 protected:
-    virtual std::optional<TString> IsLocked(const TPortionInfo& portion, const TLockScope& scope) const override {
-        Y_UNUSED(scope);
+    virtual std::optional<TString> IsLocked(const TPortionInfo& portion, const EAction action) const override {
+        Y_UNUSED(action);
         if (PathIds.contains(portion.GetPathId()) && portion.RecordSnapshotMin() <= SnapshotBarrier) {
             return GetLockName();
         }
@@ -21,16 +21,16 @@ protected:
     virtual bool IsEmpty() const override {
         return PathIds.empty();
     }
-    virtual std::optional<TString> IsLocked(const TGranuleMeta& granule, const TLockScope& scope) const override {
-        Y_UNUSED(scope);
+    virtual std::optional<TString> IsLocked(const TGranuleMeta& granule, const EAction action) const override {
+        Y_UNUSED(action);
         if (PathIds.contains(granule.GetPathId())) {
             return GetLockName();
         }
         return {};
     }
-    virtual std::optional<TString> IsLockedTableSchema(const ui64 pathId, const TLockScope& scope) const override {
+    virtual std::optional<TString> IsLockedTableSchema(const ui64 pathId, const EAction action) const override {
         Y_UNUSED(pathId);
-        Y_UNUSED(scope);
+        Y_UNUSED(action);
         return {};
     }
 public:

@@ -26,7 +26,7 @@ protected:
         return 0;
     }
     virtual std::unique_ptr<NDataLocks::ILock> DoBuildDataLock() const override {
-        return std::make_unique<NDataLocks::TListTablesLock>(TypeString() + "::" + GetTaskIdentifier(), TablesToDrop);
+        return std::make_unique<NDataLocks::TListTablesLock>(TypeString() + "::" + GetTaskIdentifier(), TablesToDrop, NDataLocks::EAction::Modify);
     }
 
 public:

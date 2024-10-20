@@ -377,7 +377,7 @@ std::shared_ptr<TCleanupPortionsColumnEngineChanges> TColumnEngineForLogs::Start
             if (info->CheckForCleanup()) {
                 continue;
             }
-            if (dataLocksManager->IsLocked(*info)) {
+            if (dataLocksManager->IsLocked(*info, NDataLocks::EAction::Modify)) { //?)) {
                 ++skipLocked;
                 continue;
             }
@@ -400,7 +400,7 @@ std::shared_ptr<TCleanupPortionsColumnEngineChanges> TColumnEngineForLogs::Start
             break;
         }
         for (ui32 i = 0; i < it->second.size();) {
-            if (dataLocksManager->IsLocked(it->second[i])) {
+            if (dataLocksManager->IsLocked(it->second[i], NDataLocks::EAction::Modify)) { //?)) {
                 ++skipLocked;
                 ++i;
                 continue;

@@ -197,7 +197,7 @@ public:
     };
 private:
     EStage Stage = EStage::Created;
-    std::unique_ptr<NDataLocks::TManager::TGuard> LockGuard;
+    std::unique_ptr<NDataLocks::TGuard> LockGuard;
     TString AbortedReason;
     const TString TaskIdentifier = TGUID::CreateTimebased().AsGuidString();
 

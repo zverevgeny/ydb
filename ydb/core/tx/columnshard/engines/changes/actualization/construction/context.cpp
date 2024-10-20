@@ -21,7 +21,7 @@ bool TTieringProcessContext::AddPortion(const TPortionInfo& info, TPortionEvicti
     if (!UsedPortions.emplace(info.GetAddress()).second) {
         return true;
     }
-    if (DataLocksManager->IsLocked(info)) {
+    if (DataLocksManager->IsLocked(info, NDataLocks::EAction::Modify)) { //?)) {
         return true;
     }
 
