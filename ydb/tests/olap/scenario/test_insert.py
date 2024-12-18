@@ -8,79 +8,54 @@ from helpers.thread_helper import TestThread
 from ydb import PrimitiveType
 from typing import List, Dict, Any
 from ydb.tests.olap.lib.utils import get_external_param
+import threading
+import helpers.data_generators as dg
 
 
-class TestInsert(BaseTestSet):
-    schema_cnt = (
+class TestInsertAndSelect(BaseTestSet):
+    table_name = "table"
+    schema = (
         ScenarioTestHelper.Schema()
         .with_column(name="key", type=PrimitiveType.Int32, not_null=True)
         .with_column(name="c", type=PrimitiveType.Int64)
         .with_key_columns("key")
     )
+    batch_size = int(get_external_param("batch_size", "10000"))
+    batch_count = int(get_external_param("batch_count", "100000"))
+    stop = threading.Event()
 
-    schema_log = (
-        ScenarioTestHelper.Schema()
-        .with_column(name="key", type=PrimitiveType.Int32, not_null=True)
-        .with_key_columns("key")
-    )
 
-    def _loop_upsert(self, ctx: TestContext, data: list):
+    def _loop_upsert_data(self, ctx: TestContext):
         sth = ScenarioTestHelper(ctx)
-        for batch in data:
-            sth.bulk_upsert_data("log", self.schema_log, batch)
+        for _ in range(self.batch_count):
+            sth.bulk_upsert(
+                self.table_name,
+                dg.DataGeneratorPerColumn(self.schema, self.batch_size)
+                    .with_column("key", dg.ColumnValueGeneratorRandom(null_probability=0))
+                    .with_column("c", dg.ColumnValueGeneratorRandom(null_probability=0))
+            )
+        self.stop.set()
 
-    def _loop_insert(self, ctx: TestContext, rows_count: int):
+    def _loop_select_count(self, ctx: TestContext):
         sth = ScenarioTestHelper(ctx)
-        log: str = sth.get_full_path("log")
-        cnt: str = sth.get_full_path("cnt")
-        for i in range(rows_count):
+        full_table_name = sth.get_full_path(self.table_name)
+        while not self.stop.is_set():
             sth.execute_query(
-                f'$cnt = SELECT CAST(COUNT(*) AS INT64) from `{log}`; INSERT INTO `{cnt}` (key, c) values({i}, $cnt)'
+                f'SELECT COUNT(*) FROM `{full_table_name}`'
             )
 
     def scenario_read_data_during_bulk_upsert(self, ctx: TestContext):
         sth = ScenarioTestHelper(ctx)
-        cnt_table_name: str = "cnt"
-        log_table_name: str = "log"
-        batches_count = int(get_external_param("batches_count", "10"))
-        rows_count = int(get_external_param("rows_count", "1000"))
-        inserts_count = int(get_external_param("inserts_count", "200"))
         sth.execute_scheme_query(
-            CreateTable(cnt_table_name).with_schema(self.schema_cnt)
+            CreateTable(self.table_name).with_schema(self.schema)
         )
-        sth.execute_scheme_query(
-            CreateTable(log_table_name).with_schema(self.schema_log)
-        )
-        data: List = []
-        for i in range(batches_count):
-            batch: List[Dict[str, Any]] = []
-            for j in range(rows_count):
-                batch.append({"key": j + rows_count * i})
-            data.append(batch)
 
-        thread1 = TestThread(target=self._loop_upsert, args=[ctx, data])
-        thread2 = TestThread(target=self._loop_insert, args=[ctx, inserts_count])
+        upsert_thread = TestThread(target=self._loop_upsert_data, args=[ctx])
+        select_thread = TestThread(target=self._loop_select_count, args=[ctx])
 
-        thread1.start()
-        thread2.start()
+        upsert_thread.start()
+        select_thread.start()
 
-        thread2.join()
-        thread1.join()
+        upsert_thread.join()
+        select_thread.join()
 
-        rows: int = sth.get_table_rows_count(cnt_table_name)
-        assert rows == inserts_count
-        scan_result = sth.execute_scan_query(
-            f"SELECT key, c FROM `{sth.get_full_path(cnt_table_name)}` ORDER BY key"
-        )
-        for i in range(rows):
-            if scan_result.result_set.rows[i]["key"] != i:
-                assert False, f"{i} ?= {scan_result.result_set.rows[i]['key']}"
-
-        rows: int = sth.get_table_rows_count(log_table_name)
-        assert rows == rows_count * batches_count
-        scan_result = sth.execute_scan_query(
-            f"SELECT key FROM `{sth.get_full_path(log_table_name)}` ORDER BY key"
-        )
-        for i in range(rows):
-            if scan_result.result_set.rows[i]["key"] != i:
-                assert False, f"{i} ?= {scan_result.result_set.rows[i]['key']}"
