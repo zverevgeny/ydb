@@ -1286,6 +1286,24 @@ Y_UNIT_TEST_SUITE(KqpOlapAggregations) {
         TestTableWithNulls({testCase});
     }
 
+    Y_UNIT_TEST(Json_ValueAndLike) {
+        TAggregationTestCase testCase;
+        testCase.SetQuery(R"(
+                SELECT id FROM `/Root/tableWithNulls`
+                WHERE 
+                    (JSON_VALUE(jsonval, "$.labels.http_status_code") = '500')
+                    AND JSON_EXISTS(jsonval, "$.meta.exception.stacktrace")
+                    AND 
+                        (JSON_VALUE(jsonval, "$.meta.uri") ilike "%unified%")
+            )")
+            .AddExpectedPlanOptions("KqpOlapFilter");
+            // .SetExpectedReply(R"([[1;["val1"];#]])");
+
+        TestTableWithNulls({testCase});
+    }
+
+
+
     Y_UNIT_TEST(Json_GetValue_Minus) {
         TAggregationTestCase testCase;
         testCase.SetQuery(R"(
@@ -1310,9 +1328,7 @@ Y_UNIT_TEST_SUITE(KqpOlapAggregations) {
                 SELECT id, JSON_VALUE(jsonval, "$.col1" RETURNING String), JSON_VALUE(jsondoc, "$.col1") FROM `/Root/tableWithNulls`
                 WHERE JSON_VALUE(jsonval, "$.col1" RETURNING String) = "val1" AND id = 1;
             )")
-#if SSA_RUNTIME_VERSION >= 5U
-            .AddExpectedPlanOptions("KqpOlapApply")
-#elif SSA_RUNTIME_VERSION >= 3U
+#if SSA_RUNTIME_VERSION >= 3U
             .AddExpectedPlanOptions("KqpOlapJsonValue")
 #else
             .AddExpectedPlanOptions("Udf")
