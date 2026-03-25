@@ -10,7 +10,7 @@
 
 {% note info %}
 
-В примерах `ydb_source` — это заранее созданный [внешний источник данных](../../../../concepts/datamodel/external_data_source.md), а `topic_name` — топик, доступный через него.
+В примерах `topic_name` — [топик](../../../../concepts/datamodel/topic.md) в текущей базе данных.
 
 {% endnote %}
 
@@ -20,7 +20,7 @@
 SELECT
     Data
 FROM
-    ydb_source.topic_name
+    topic_name
 WITH (
     FORMAT = raw,
     SCHEMA = (

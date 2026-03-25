@@ -10,7 +10,7 @@
 
 {% note info %}
 
-В примерах `ydb_source` — это заранее созданный [внешний источник данных](../../concepts/datamodel/external_data_source.md), а `topic_name` / `input_topic` — топики, доступные через него.
+В примерах `topic_name` и `input_topic` — [топики](../../concepts/datamodel/topic.md) в текущей базе данных.
 
 {% endnote %}
 
@@ -22,7 +22,7 @@
 SELECT
     Data
 FROM
-    ydb_source.topic_name
+    topic_name
 WITH (
     FORMAT = raw,
     SCHEMA = (
@@ -43,7 +43,7 @@ LIMIT 1
 SELECT
     *
 FROM
-    ydb_source.topic_name
+    topic_name
 WITH (
     FORMAT = json_each_row,
     SCHEMA = (
