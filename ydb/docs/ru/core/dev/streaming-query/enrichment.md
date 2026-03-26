@@ -4,6 +4,13 @@
 
 В [потоковых запросах](../../concepts/streaming-query.md) справочник подключают с помощью `JOIN`: слева остаётся поток (чтение из топика или промежуточный результат), справа — таблица в {{ ydb-short-name }} или данные из [объектного хранилища S3](#enrichment-s3).
 
+{% note warning %}
+
+Справочник полностью загружается в память при запуске запроса. Если данные в справочнике изменились, для получения актуальной версии справочника необходимо перезапустить запрос — удалить его с помощью [DROP STREAMING QUERY](../../yql/reference/syntax/drop-streaming-query.md) и создать заново с помощью [CREATE STREAMING QUERY](../../yql/reference/syntax/create-streaming-query.md).
+В будущих вресиях {{ ydb-short-name }} данное ограничение будет снято
+
+{% endnote %}
+
 ## Обогащение из локальной таблицы {#enrichment-local-table}
 
 Справочником может служить [таблица](../../concepts/datamodel/table.md) в текущей базе данных. Таблица должна существовать до запуска потокового запроса и содержать поля для соединения с потоком (например, общий идентификатор).
@@ -52,9 +59,7 @@ FROM
 END DO
 ```
 
-Концептуально: [{#T}](../../concepts/streaming-query.md#enrichment-ydb-tables).
-
-Подробнее о функциях сериализации в JSON:
+Подробнее об используемых функциях:
 
 - [TableRow](../../yql/reference/builtins/basic#tablerow)
 - [Yson::From](../../yql/reference/udf/list/yson#ysonfrom)
@@ -66,11 +71,7 @@ END DO
 
 Справочник задаётся файлом в S3; в `JOIN` поток остаётся слева, выборка из файла через [внешнюю таблицу](../../concepts/query_execution/federated_query/s3/external_table.md) — справа.
 
-{% note warning %}
 
-Справочник из S3 полностью загружается в память при запуске запроса. Если данные в S3 изменились, для получения актуальной версии справочника необходимо перезапустить запрос — удалить его с помощью [DROP STREAMING QUERY](../../yql/reference/syntax/drop-streaming-query.md) и создать заново с помощью [CREATE STREAMING QUERY](../../yql/reference/syntax/create-streaming-query.md).
-
-{% endnote %}
 
 Справочник хранится в S3 и подключается через [внешний источник данных](../../concepts/query_execution/federated_query/s3/external_data_source.md).
 
@@ -83,7 +84,7 @@ CREATE EXTERNAL DATA SOURCE s3_source WITH (
     SOURCE_TYPE = "ObjectStorage",
     LOCATION = "<s3_endpoint>",
     AUTH_METHOD = "NONE"
-)
+);
 ```
 
 Где:
@@ -148,5 +149,3 @@ FROM
 
 END DO
 ```
-
-Те же функции сериализации, что и в [разделе про локальную таблицу](#enrichment-local-table).
