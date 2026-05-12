@@ -4,7 +4,11 @@
 
 **Режимы CLI**
   - ``INPUT.ndjson --internalized-out X.dump`` — ``read_ndjson`` + запись дампа во внешний файл.
-  - ``--read-internalized-only X.dump`` — только чтение дампа (позиционный ``INPUT`` не указывать).
+  - ``--read-internalized-only X.dump`` — только чтение дампа (позиционный ``INPUT`` не указывать);
+    дополнительно пишутся ``catalog.dmp`` / ``rows.dmp`` (``FlatPairs``) и по умолчанию
+    ``combined_catalog.dmp`` / ``rows_combined.dmp`` (``FlatCombinedPairs``: единый каталог
+    ``list[list[tuple[int,int]]]`` — сначала по одной паре на слот, затем частые цепочки пар;
+    строки — индексы в этот каталог).
 
 **NDJSON** (``read_ndjson``): каждая строка — JSON-объект; вложенные объекты и **массивы** раскрываются
 по пути. Элемент пути — ``PathElement`` с дискриминатором ``PathElement.Kind``: ключ подобъекта,
@@ -39,7 +43,8 @@ import time
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Any, ClassVar, Iterator
+from typing import Any, ClassVar, Iterable, Iterator
+
 import zstandard as zstd
 from collections import Counter
 
@@ -538,6 +543,191 @@ class FlattenInternalized:
         print(f"\tRows: {len(self.rows)}")
 
 
+@dataclass
+class FlatPairs:
+    """Уникальные пары ``(path_id, value_id)`` в ``pair_catalog``; ``rows`` — индексы в каталог по строкам."""
+
+    path_pool: PathInternPool
+    value_pool: ValueInternPool
+    pair_catalog: list[tuple[int, int]]
+    rows: list[list[int]]
+
+    def print_stat(self) -> None:
+        print("FlatPairs stat:")
+        print(f"\tPaths (path_pool): {len(self.path_pool.entries)}")
+        print(f"\tValues (value_pool): {len(self.value_pool.entries)}")
+        print(f"\tUnique pairs in pair_catalog: {len(self.pair_catalog)}")
+        print(f"\tRows: {len(self.rows)}")
+
+
+def collect_pair_index_ngram_counts(
+    rows: list[list[int]],
+    ngram_lengths: Iterable[int],
+) -> Counter[tuple[int, ...]]:
+    """
+    Частоты подряд идущих ``n`` индексов в ``pair_catalog`` по строкам (``rows`` уже отсортированы).
+    Та же эвристика, что в ``rows_frequent_heuristic.py``: n-граммы по отсортированной строке индексов.
+    """
+    lengths = sorted({int(x) for x in ngram_lengths if int(x) >= 2})
+    c: Counter[tuple[int, ...]] = Counter()
+    for row in rows:
+        arr = row
+        for n in lengths:
+            if len(arr) < n:
+                continue
+            for i in range(len(arr) - n + 1):
+                c[tuple(arr[i : i + n])] += 1
+    return c
+
+
+def _pick_subset_catalog_from_counter(
+    counter: Counter[tuple[int, ...]],
+    *,
+    max_subsets: int,
+    min_occurrences: int,
+    min_len: int = 2,
+) -> list[list[int]]:
+    """Отобрать до ``max_subsets`` фрагментов с наибольшим «выигрышем» ``count * (len - 1)``."""
+    cands: list[tuple[tuple[int, ...], int]] = [
+        (t, cnt) for t, cnt in counter.items() if cnt >= min_occurrences and len(t) >= min_len
+    ]
+    cands.sort(
+        key=lambda tc: (
+            -(tc[1] * (len(tc[0]) - 1)),
+            -len(tc[0]),
+            -tc[1],
+            tc[0],
+        )
+    )
+    out: list[list[int]] = []
+    seen: set[tuple[int, ...]] = set()
+    for tup, _cnt in cands:
+        if tup in seen:
+            continue
+        seen.add(tup)
+        out.append(list(tup))
+        if len(out) >= max_subsets:
+            break
+    return out
+
+
+def _encode_flat_pairs_row_longest_match(
+    row: list[int],
+    tup_to_combined_id: dict[tuple[int, ...], int],
+    max_multi_len: int,
+) -> list[int]:
+    """Жадно: слева направо, наиболее длинное совпадение с **мульти**-записью объединённого каталога."""
+    i = 0
+    tokens: list[int] = []
+    n = len(row)
+    while i < n:
+        matched = False
+        high = min(max_multi_len, n - i)
+        for ln in range(high, 1, -1):
+            seg = tuple(row[i : i + ln])
+            cid = tup_to_combined_id.get(seg)
+            if cid is not None:
+                tokens.append(cid)
+                i += ln
+                matched = True
+                break
+        if not matched:
+            tokens.append(row[i])
+            i += 1
+    return tokens
+
+
+def flat_pairs_to_flat_combined_pairs(
+    flat: FlatPairs,
+    *,
+    ngram_lengths: Iterable[int] = (3, 4, 5, 6),
+    max_subsets: int = 100_000,
+    min_occurrences: int = 1_000,
+) -> FlatCombinedPairs:
+    """
+    Построить ``FlatCombinedPairs``: единый ``combined_catalog`` — сначала по одной паре
+    на индекс ``0..P-1`` (как ``FlatPairs.pair_catalog``), затем частые цепочки пар
+    ``list[tuple[int,int]]``. Строки — только индексы в ``combined_catalog`` (короче JSON).
+    """
+    pair_catalog = flat.pair_catalog
+    p = len(pair_catalog)
+    combined_catalog: list[list[tuple[int, int]]] = [[pair_catalog[i]] for i in range(p)]
+
+    counter = collect_pair_index_ngram_counts(flat.rows, ngram_lengths)
+    multi_pair_index_lists = _pick_subset_catalog_from_counter(
+        counter,
+        max_subsets=max_subsets,
+        min_occurrences=min_occurrences,
+        min_len=2,
+    )
+    for idx_list in multi_pair_index_lists:
+        combined_catalog.append([pair_catalog[k] for k in idx_list])
+
+    tup_to_combined_id: dict[tuple[int, ...], int] = {
+        tuple(lst): p + j for j, lst in enumerate(multi_pair_index_lists)
+    }
+    max_multi_len = max((len(s) for s in multi_pair_index_lists), default=0)
+
+    enc_rows: list[list[int]] = []
+    for row in flat.rows:
+        enc = _encode_flat_pairs_row_longest_match(row, tup_to_combined_id, max_multi_len)
+        enc_rows.append(enc)
+
+    return FlatCombinedPairs(
+        path_pool=flat.path_pool,
+        value_pool=flat.value_pool,
+        combined_catalog=combined_catalog,
+        rows=enc_rows,
+    )
+
+
+@dataclass
+class FlatCombinedPairs:
+    """
+    Как ``FlatPairs``, но каталог пар единый: ``combined_catalog`` — ``list[list[tuple[int,int]]]``.
+    Первые ``P`` элементов — ``[(path_id, value_id)]`` по одной паре (индекс ``i`` соответствует
+    ``FlatPairs.pair_catalog[i]``). Дальше — частые подряд идущие цепочки пар (эвристика n-грамм
+    по отсортированным индексам).
+
+    ``rows[k]`` — список неотрицательных индексов в ``combined_catalog`` (индексы ``< P`` —
+    одиночные пары, ``≥ P`` — мульти-записи каталога).
+    """
+
+    path_pool: PathInternPool
+    value_pool: ValueInternPool
+    combined_catalog: list[list[tuple[int, int]]]
+    rows: list[list[int]]
+
+    def print_stat(self) -> None:
+        print("FlatCombinedPairs stat:")
+        cc = self.combined_catalog
+        p = next((i for i, ch in enumerate(cc) if len(ch) != 1), len(cc))
+        n_multi = len(cc) - p
+
+        print(f"\tPaths (path_pool): {len(self.path_pool.entries)}")
+        print(f"\tValues (value_pool): {len(self.value_pool.entries)}")
+        print(f"\tSingleton pair slots in combined_catalog: {p:,}")
+        print(f"\tMulti-pair catalog entries: {n_multi:,}")
+        print(f"\tCombined catalog size: {len(cc):,}")
+        print(f"\tRows: {len(self.rows)}")
+        n_tok = sum(len(r) for r in self.rows)
+        n_pair_slots = 0
+        for r in self.rows:
+            for t in r:
+                if t < p:
+                    n_pair_slots += 1
+                else:
+                    n_pair_slots += len(cc[t])
+        print(f"\tTotal row tokens (encoded): {n_tok:,}")
+        print(f"\tLogical pair slots (sum of chunk sizes): {n_pair_slots:,}")
+        if self.rows:
+            print(f"\tAvg tokens per row (encoded): {n_tok / len(self.rows):.2f}")
+        if self.rows and n_pair_slots > 0:
+            print(f"\tAvg logical pair slots per row: {n_pair_slots / len(self.rows):.2f}")
+        if n_pair_slots > 0:
+            print(f"\tEncoded / logical-slot ratio: {n_tok / n_pair_slots:.4f}")
+
+
 def read_ndjson(path: Path, *, progress: bool = False) -> FlattenInternalized:
     rows: list[dict[int, int]] = []
     path_pool = PathInternPool()
@@ -747,9 +937,107 @@ def compress_internalized(state: FlattenInternalized, level: int) -> None:
     # entries.sort()  # опционально: фиксированный порядок для сравнимости zstd между прогонами
     values = "\n".join(entries)
     compress_and_print_stat("values", values, level, 0)
-    # with open("values.dmp", "wb") as f:
-    #     f.write(values.encode("utf-8"))
+    with open("values.dmp", "wb") as f:
+        f.write(values.encode("utf-8"))
     compress_and_print_stat("rows", str(state.rows), level, 0)
+
+
+def build_pair_catalog_and_row_indices(state: FlattenInternalized) -> FlatPairs:
+    """
+    Уникальные пары ``(path_id, value_id)`` — индексы в ``path_pool`` и ``value_pool``; каталог
+    упорядочен по возрастанию ``path_id``, при равенстве — по ``value_id``. Каждая строка таблицы —
+    список индексов в ``pair_catalog``, отсортированный по возрастанию индекса.
+    """
+    seen: set[tuple[int, int]] = set()
+    for row in state.rows:
+        for path_id in sorted(row.keys(), key=int):
+            seen.add((int(path_id), int(row[path_id])))
+    pair_catalog = sorted(seen, key=lambda t: (t[0], t[1]))
+    pair_index = {pair: i for i, pair in enumerate(pair_catalog)}
+
+    rows_ix: list[list[int]] = []
+    for row in state.rows:
+        idxs = sorted(
+            pair_index[(int(path_id), int(row[path_id]))]
+            for path_id in sorted(row.keys(), key=int)
+        )
+        rows_ix.append(idxs)
+    return FlatPairs(
+        path_pool=state.path_pool,
+        value_pool=state.value_pool,
+        pair_catalog=pair_catalog,
+        rows=rows_ix,
+    )
+
+
+def compress_pairs(state: FlattenInternalized, level: int) -> FlatPairs:
+    """
+    Каталог уникальных пар ``(path_id, value_id)`` и строки как списки индексов в каталог.
+    Сериализация: отдельно ``pair_catalog`` (JSON ``[path_id, value_id]`` на строку) и отдельно
+    ``rows`` (JSON-массив индексов на строку); для каждого блока — ``compress_and_print_stat``.
+    """
+    flat = build_pair_catalog_and_row_indices(state)
+    flat.print_stat()
+    catalog_blob = "\n".join(
+        json.dumps([pid, vid], ensure_ascii=False, separators=_JSON_SEP)
+        for pid, vid in flat.pair_catalog
+    )
+    rows_blob = "\n".join(
+        json.dumps(sorted(ixs), ensure_ascii=False, separators=_JSON_SEP)
+        for ixs in flat.rows
+    )
+    with open("catalog.dmp", "wb") as f:
+        f.write(catalog_blob.encode("utf-8"))
+    with open("rows.dmp", "wb") as f:
+        f.write(rows_blob.encode("utf-8"))
+
+    compress_and_print_stat("pairs_catalog", catalog_blob, level, 0)
+    compress_and_print_stat("pairs_rows", rows_blob, level, 0)
+    return flat
+
+
+def compress_flat_combined_pairs(
+    flat: FlatPairs,
+    level: int,
+    *,
+    ngram_lengths: tuple[int, ...],
+    max_subsets: int,
+    min_occurrences: int,
+    combined_catalog_path: Path,
+    rows_combined_path: Path,
+    progress: bool = False,
+) -> FlatCombinedPairs:
+    """
+    Эвристика n-грамм по ``flat.rows`` → ``FlatCombinedPairs``; дампы ``combined_catalog`` и
+    ``rows_combined`` + zstd-статистика длины строк (короче, чем ``rows.dmp`` при тех же парах).
+    """
+    if progress:
+        _progress_log("FlatCombinedPairs: подсчёт n-грамм и кодирование строк…")
+    t0 = time.perf_counter()
+    combined = flat_pairs_to_flat_combined_pairs(
+        flat,
+        ngram_lengths=ngram_lengths,
+        max_subsets=max_subsets,
+        min_occurrences=min_occurrences,
+    )
+    if progress:
+        _timing_log("flat_pairs_to_flat_combined_pairs", time.perf_counter() - t0)
+    combined.print_stat()
+
+    catalog_blob = "\n".join(
+        json.dumps([[a, b] for a, b in chunk], ensure_ascii=False, separators=_JSON_SEP)
+        for chunk in combined.combined_catalog
+    )
+    rows_blob = "\n".join(
+        json.dumps(r, ensure_ascii=False, separators=_JSON_SEP)
+        for r in combined.rows
+    )
+    combined_catalog_path.write_bytes(catalog_blob.encode("utf-8"))
+    rows_combined_path.write_bytes(rows_blob.encode("utf-8"))
+
+    compress_and_print_stat("combined_pair_catalog", catalog_blob, level, 0)
+    compress_and_print_stat("rows_combined", rows_blob, level, 0)
+    return combined
 
 
 def main() -> None:
@@ -781,6 +1069,47 @@ def main() -> None:
         action="store_true",
         help="не печатать в stderr промежуточные сообщения [ndjson-compress] о ходе работы",
     )
+    ap.add_argument(
+        "--skip-combined-pairs",
+        action="store_true",
+        help="при --read-internalized-only не строить FlatCombinedPairs (combined_catalog / rows_combined)",
+    )
+    ap.add_argument(
+        "--combined-ngram",
+        type=int,
+        nargs="*",
+        default=None,
+        metavar="N",
+        help="длины n-грамм индексов в pair_catalog (по умолчану 3 4 5 6); только вместе с дампом пар",
+    )
+    ap.add_argument(
+        "--combined-max-subsets",
+        type=int,
+        default=100_000,
+        metavar="K",
+        help="максимум **мульти**-записей в combined_catalog (по умолчану 100000); слоты одиночных пар = числу уникальных пар",
+    )
+    ap.add_argument(
+        "--combined-min-count",
+        type=int,
+        default=1_000,
+        metavar="M",
+        help="n-грамма попадает в мульти-каталог, если встречается не менее M раз (по умолчану 1000)",
+    )
+    ap.add_argument(
+        "--combined-catalog-out",
+        type=Path,
+        default=Path("combined_catalog.dmp"),
+        metavar="FILE",
+        help="единый каталог: по строке JSON-массив пар [[path_id,value_id], ...]",
+    )
+    ap.add_argument(
+        "--combined-rows-out",
+        type=Path,
+        default=Path("rows_combined.dmp"),
+        metavar="FILE",
+        help="строки FlatCombinedPairs: JSON-массив индексов в combined_catalog",
+    )
     ap.add_argument("input", type=Path, nargs="?", default=None, help="входной NDJSON")
     args = ap.parse_args()
 
@@ -801,6 +1130,26 @@ def main() -> None:
         t_step = time.perf_counter()
         compress_internalized(internal_state, 6)
         _timing_log("compress_internalized", time.perf_counter() - t_step)
+        t_pairs = time.perf_counter()
+        flat_pairs = compress_pairs(internal_state, 6)
+        _timing_log("compress_pairs", time.perf_counter() - t_pairs)
+        if not args.skip_combined_pairs:
+            raw_ngram = args.combined_ngram if args.combined_ngram is not None else [3, 4, 5, 6]
+            ngram_t = tuple(sorted({int(n) for n in raw_ngram if int(n) >= 2}))
+            if not ngram_t:
+                ap.error("нужна хотя бы одна длина n-граммы >= 2 (--combined-ngram)")
+            t_comb = time.perf_counter()
+            compress_flat_combined_pairs(
+                flat_pairs,
+                6,
+                ngram_lengths=ngram_t,
+                max_subsets=max(1, args.combined_max_subsets),
+                min_occurrences=max(2, args.combined_min_count),
+                combined_catalog_path=args.combined_catalog_out,
+                rows_combined_path=args.combined_rows_out,
+                progress=pg,
+            )
+            _timing_log("compress_flat_combined_pairs", time.perf_counter() - t_comb)
         if tm:
             print(
                 f"[ndjson-compress] всего (сумма измеренных шагов): {dt_read:.3f} s",
