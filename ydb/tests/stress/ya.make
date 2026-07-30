@@ -35,5 +35,6 @@ RECURSE(
     vector_workload
     viewer
     streaming
+    yt_queue
     tpcc
 )

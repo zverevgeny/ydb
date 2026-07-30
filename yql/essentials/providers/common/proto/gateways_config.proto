@@ -300,9 +300,10 @@ message TRtmrGatewayConfig {
 
 message TPqClusterConfig {
     enum EClusterType {
-        CT_UNSPECIFIED = 0;
-        CT_PERS_QUEUE = 1;
-        CT_DATA_STREAMS = 2;
+        CT_UNSPECIFIED = 0; // Unspecified cluster type (default proto value)
+        CT_PERS_QUEUE = 1; // YDB Persistent Queue (uses ConfigManager client)
+        CT_DATA_STREAMS = 2; // YDB Data Streams / Topics
+        CT_YT = 3; // YTsaurus queue
     }
 
     optional string Name = 1;

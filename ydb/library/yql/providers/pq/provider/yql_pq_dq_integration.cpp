@@ -399,6 +399,9 @@ public:
             return NPq::NProto::PersQueue;
         case NYql::TPqClusterConfig::CT_DATA_STREAMS:
             return NPq::NProto::DataStreams;
+        case NYql::TPqClusterConfig::CT_YT:
+            // YT queues reuse the topic read pipeline; no dedicated DQ cluster type.
+            return NPq::NProto::Unspecified;
         }
     }
 

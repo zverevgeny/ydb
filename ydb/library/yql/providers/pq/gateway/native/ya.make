@@ -13,6 +13,7 @@ PEERDIR(
     ydb/library/yql/providers/pq/gateway/abstract
     ydb/library/yql/providers/pq/gateway/clients/external
     ydb/library/yql/providers/pq/gateway/clients/local
+    ydb/library/yql/providers/pq/gateway/clients/yt
     ydb/library/yverify_stream
     ydb/public/sdk/cpp/src/client/datastreams
     ydb/public/sdk/cpp/src/client/driver
@@ -21,6 +22,9 @@ PEERDIR(
     yql/essentials/providers/common/proto
     yql/essentials/utils
     yql/essentials/utils/log
+    yt/yt/client
 )
+
+YQL_LAST_ABI_VERSION()
 
 END()

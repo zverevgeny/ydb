@@ -317,7 +317,14 @@ public:
     void AddCluster(const TString& clusterName, const THashMap<TString, TString>& properties) override {
         NYql::TPqClusterConfig cluster;
         cluster.SetName(clusterName);
-        cluster.SetClusterType(NYql::TPqClusterConfig::CT_DATA_STREAMS);
+
+        TString sourceType = properties.Value("source_type", "");
+        sourceType.to_lower();
+        const bool isYt = sourceType == "yt"sv;
+        cluster.SetClusterType(isYt
+            ? NYql::TPqClusterConfig::CT_YT
+            : NYql::TPqClusterConfig::CT_DATA_STREAMS);
+
         const TString& location = properties.Value("location", "");
         cluster.SetEndpoint(location);
         cluster.SetToken(properties.Value("token", ""));

@@ -3,15 +3,21 @@
 
 #include <ydb/library/yql/providers/pq/gateway/clients/external/yql_pq_federated_topic_client.h>
 #include <ydb/library/yql/providers/pq/gateway/clients/external/yql_pq_topic_client.h>
+#include <ydb/library/yql/providers/pq/gateway/clients/yt/yql_yt_topic_client.h>
 #include <ydb/library/yverify_stream/yverify_stream.h>
 #include <ydb/public/sdk/cpp/include/ydb-cpp-sdk/client/driver/driver.h>
 
 #include <yql/essentials/providers/common/proto/gateways_config.pb.h>
 #include <yql/essentials/utils/log/context.h>
 
+#include <yt/yt/client/api/client.h>
+#include <yt/yt/client/api/rpc_proxy/config.h>
+#include <yt/yt/client/api/rpc_proxy/connection.h>
+
 #include <util/system/mutex.h>
 
 #include <memory>
+#include <optional>
 
 namespace NYql {
 
@@ -101,6 +107,10 @@ public:
     }
 
     ITopicClient::TPtr GetTopicClient(const TDriver& driver, const TTopicClientSettings& settings) final {
+        if (auto ytClient = TryCreateYtTopicClient(settings)) {
+            return ytClient;
+        }
+
         const bool hasEndpoint = HasEndpoint(driver, settings);
         if (!hasEndpoint && LocalTopicClientFactory) {
             return LocalTopicClientFactory->CreateTopicClient(settings);
@@ -149,6 +159,60 @@ public:
     }
 
 private:
+    // Returns a YT-backed topic client if the settings resolve to a cluster of
+    // type CT_YT, otherwise nullptr (so the caller falls back to YDB topics).
+    ITopicClient::TPtr TryCreateYtTopicClient(const TTopicClientSettings& settings) {
+        with_lock (Mutex) {
+            const NYql::TPqClusterConfig* ytConfig = FindYtClusterConfig(settings);
+            if (!ytConfig) {
+                return nullptr;
+            }
+
+            const TString& clusterName = ytConfig->GetName();
+            auto clientIt = YtClients.find(clusterName);
+            if (clientIt == YtClients.end()) {
+                clientIt = YtClients.emplace(clusterName, CreateYtClient(*ytConfig)).first;
+            }
+
+            TYtTopicClientSettings topicSettings;
+            topicSettings.Client = clientIt->second;
+            return CreateYtTopicClient(topicSettings);
+        }
+    }
+
+    // Must be called under Mutex.
+    const NYql::TPqClusterConfig* FindYtClusterConfig(const TTopicClientSettings& settings) const {
+        if (!ClusterConfigs) {
+            return nullptr;
+        }
+        const TString endpoint = TString(settings.DiscoveryEndpoint_.value_or(""));
+        const TString database = TString(settings.Database_.value_or(""));
+        for (const auto& [name, config] : *ClusterConfigs) {
+            if (config.GetClusterType() != NYql::TPqClusterConfig::CT_YT) {
+                continue;
+            }
+            if ((!endpoint.empty() && config.GetEndpoint() == endpoint) ||
+                (!database.empty() && config.GetDatabase() == database)) {
+                return &config;
+            }
+        }
+        return nullptr;
+    }
+
+    static NYT::NApi::IClientPtr CreateYtClient(const NYql::TPqClusterConfig& config) {
+        auto connectionConfig = NYT::New<NYT::NApi::NRpcProxy::TConnectionConfig>();
+        connectionConfig->ClusterUrl = std::string(config.GetEndpoint());
+        connectionConfig->ConnectionType = NYT::NApi::EConnectionType::Rpc;
+
+        auto connection = NYT::NApi::NRpcProxy::CreateConnection(connectionConfig);
+
+        NYT::NApi::TClientOptions options;
+        if (!config.GetToken().empty()) {
+            options = NYT::NApi::TClientOptions::FromToken(std::string(config.GetToken()));
+        }
+        return connection->CreateClient(options);
+    }
+
     static bool HasEndpoint(const TDriver& driver, const TCommonClientSettings& settings) {
         if (!driver.GetConfig().GetEndpoint().empty()) {
             return true;
@@ -177,6 +241,7 @@ private:
     mutable TMutex Mutex;
     TPqClusterConfigsMapPtr ClusterConfigs;
     THashMap<TString, TPqSession::TPtr> Sessions;
+    THashMap<TString, NYT::NApi::IClientPtr> YtClients;
 };
 
 } // anonymous namespace
