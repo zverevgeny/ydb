@@ -150,17 +150,12 @@ public:
                 );
 
             if (stage.SourcesSize() > 0 && stage.GetSources(0).GetTypeCase() == NKqpProto::TKqpSource::kReadRangesSource) {
-                // DIAGNOSTIC: Log if PrunedPartitions is empty at this site (GetSimplifiedUseFollowers).
-                // This is a separate code path from the crash site in CountScanTasksFromSource but
-                // can also hit .at(0) on an empty vector. Log context before the access.
+                // A kReadRangesSource stage may reach this point without its
+                // PrunedPartitions being populated (e.g. EXPLAIN, or a stage that
+                // is not the one the resolve loop pruned). Treat it as having no
+                // partitions instead of throwing std::out_of_range on .at(0).
                 if (stageInfo.Meta.PrunedPartitions.empty()) {
-                    YDB_LOG_ERROR("CRASH DIAGNOSTIC: PrunedPartitions is EMPTY for kReadRangesSource stage "
-                        "in GetSimplifiedUseFollowers - std::out_of_range about to be thrown at .at(0).",
-                        {"marker", "KQPDATAPRUNED_EMPTY_FOLLOWERS"},
-                        {"txId", stageInfo.Id.TxId},
-                        {"stageId", stageInfo.Id.StageId},
-                        {"tablePath", stageInfo.Meta.TablePath},
-                        {"sourceTablePath", stage.GetSources(0).GetReadRangesSource().GetTable().GetPath()});
+                    continue;
                 }
                 const auto& source = stage.GetSources(0).GetReadRangesSource();
                 const auto& partitions = stageInfo.Meta.PrunedPartitions.at(0);
