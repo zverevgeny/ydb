@@ -1461,8 +1461,10 @@ namespace Tests {
                 }
             }
 
-            auto counters = MakeIntrusive<::NMonitoring::TDynamicCounters>();
-            Runtime->GetAppData(nodeIdx).KqpComputeScheduler = NKqp::CreateKqpComputeScheduler(counters, *Settings->AppConfig);
+            // Use AppData counters so tests can observe schedulerPool/* sensors
+            // (same wiring as production in driver_lib/run).
+            Runtime->GetAppData(nodeIdx).KqpComputeScheduler = NKqp::CreateKqpComputeScheduler(
+                Runtime->GetAppData(nodeIdx).Counters, *Settings->AppConfig);
 
             if (!Settings->AppConfig->GetTableServiceConfig().HasEnableCompileCacheWarmup()) {
                 Settings->AppConfig->MutableTableServiceConfig()->SetEnableCompileCacheWarmup(false);

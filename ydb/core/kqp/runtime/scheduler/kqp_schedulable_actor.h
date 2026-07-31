@@ -34,6 +34,13 @@ protected:
     inline bool IsThrottled() const {
         return Throttled;
     }
+    bool IsIdle() const;
+
+    void EnterIdle();
+    void ExitIdle();
+
+    // Account CPU spent outside DoExecuteImpl (e.g. Topic SDK decompression threads).
+    void AccountBurstUsage(const TDuration& burstUsage);
 
     bool StartExecution(TMonotonic now);
     void StopExecution(bool& forcedResume);

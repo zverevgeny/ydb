@@ -31,6 +31,29 @@ void TSchedulableActorBase::RegisterForResume(const NActors::TActorId& actorId) 
     }
 }
 
+bool TSchedulableActorBase::IsIdle() const {
+    return SchedulableTask && SchedulableTask->IsIdle();
+}
+
+void TSchedulableActorBase::EnterIdle() {
+    Y_ASSERT(SchedulableTask);
+    if (!SchedulableTask->IsIdle()) {
+        SchedulableTask->EnterIdle();
+    }
+}
+
+void TSchedulableActorBase::ExitIdle() {
+    Y_ASSERT(SchedulableTask);
+    if (SchedulableTask->IsIdle()) {
+        SchedulableTask->ExitIdle();
+    }
+}
+
+void TSchedulableActorBase::AccountBurstUsage(const TDuration& burstUsage) {
+    Y_ASSERT(SchedulableTask);
+    SchedulableTask->AccountBurstUsage(burstUsage, TSchedulableTask::CPU_DEFAULT);
+}
+
 bool TSchedulableActorBase::StartExecution(TMonotonic now) {
     Y_ASSERT(SchedulableTask);
     Y_ASSERT(!Executed);

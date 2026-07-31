@@ -108,6 +108,11 @@ struct IDqComputeActorAsyncInput {
         return TDuration::Zero();
     }
 
+    // Called by schedulable CA when HDRF throttles/unthrottles this task.
+    // Sources may suppress NotifyCA / stop pulling SDK events while throttled.
+    virtual void SetSchedulerThrottled(bool /*throttled*/) {
+    }
+
     virtual TMaybe<google::protobuf::Any> ExtraData() { return {}; }
 
     virtual void FillExtraStats(NDqProto::TDqTaskStats* /* stats */, bool /* finalized stats */, const NYql::NDq::TDqMeteringStats*) { }
@@ -172,6 +177,10 @@ struct IDqComputeActorAsyncOutput {
     // Checkpointing.
     virtual void CommitState(const NDqProto::TCheckpoint& checkpoint) = 0; // Apply side effects related to this checkpoint.
     virtual void LoadState(const TSinkState& state) = 0;
+
+    virtual TDuration GetCpuTime() {
+        return TDuration::Zero();
+    }
 
     virtual TMaybe<google::protobuf::Any> ExtraData() { return {}; }
 

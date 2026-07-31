@@ -2,6 +2,7 @@
 #include "dq_pq_meta_extractor.h"
 #include "dq_pq_rd_read_actor.h"
 #include "dq_pq_read_actor_base.h"
+#include "dq_pq_cpu_accounting_executor.h"
 #include "probes.h"
 
 #include <ydb/core/base/appdata_fwd.h>
@@ -25,6 +26,7 @@
 #include <ydb/public/sdk/cpp/include/ydb-cpp-sdk/client/federated_topic/federated_topic.h>
 #include <ydb/public/sdk/cpp/include/ydb-cpp-sdk/client/topic/client.h>
 #include <ydb/public/sdk/cpp/include/ydb-cpp-sdk/client/types/credentials/credentials.h>
+#include <ydb/public/sdk/cpp/include/ydb-cpp-sdk/client/types/executor/executor.h>
 
 #include <yql/essentials/minikql/comp_nodes/mkql_saveload.h>
 #include <yql/essentials/minikql/mkql_alloc.h>
@@ -40,6 +42,7 @@
 #include <util/generic/utility.h>
 #include <util/string/join.h>
 
+#include <atomic>
 #include <queue>
 #include <variant>
 
@@ -204,6 +207,8 @@ class TDqPqReadActor : public TActor<TDqPqReadActor>, public NYql::NDq::NInterna
             AsyncInputDataRate = Task->GetCounter("AsyncInputDataRate", true);
             ReconnectRate = Task->GetCounter("ReconnectRate", true);
             DataRate = Task->GetCounter("DataRate", true);
+            ReadyBufferBytes = Task->GetCounter("ReadyBufferBytes");
+            SdkBufferLimitBytes = Task->GetCounter("SdkBufferLimitBytes");
             WaitEventTimeMs = Source->GetHistogram("WaitEventTimeMs", NMonitoring::ExplicitHistogram({5, 20, 100, 500, 2000}));
         }
 
@@ -223,6 +228,8 @@ class TDqPqReadActor : public TActor<TDqPqReadActor>, public NYql::NDq::NInterna
         ::NMonitoring::TDynamicCounters::TCounterPtr AsyncInputDataRate;
         ::NMonitoring::TDynamicCounters::TCounterPtr ReconnectRate;
         ::NMonitoring::TDynamicCounters::TCounterPtr DataRate;
+        ::NMonitoring::TDynamicCounters::TCounterPtr ReadyBufferBytes;
+        ::NMonitoring::TDynamicCounters::TCounterPtr SdkBufferLimitBytes;
         NMonitoring::THistogramPtr WaitEventTimeMs;
     };
 
@@ -280,7 +287,13 @@ public:
         , TopicPartitionsCount(topicPartitionsCount)
         , WithoutConsumer(SourceParams.GetConsumerName().empty())
         , CheckPartitionCountPeriod(checkPartitionCountPeriod)
+        , DecompressionCpuMicros(std::make_shared<std::atomic<ui64>>(0))
+        , DecompressionExecutor(std::make_shared<TCpuAccountingExecutor>(
+            NYdb::CreateThreadPoolExecutor(2),
+            DecompressionCpuMicros))
     {
+        Metrics.SdkBufferLimitBytes->Set(BufferSize);
+        Metrics.ReadyBufferBytes->Set(0);
         if (const auto& period = SourceParams.GetReconnectPeriod(); !TDuration::TryParse(period, ReconnectPeriod)) {
             SRC_LOG_N("Failed to parse reconnect period: " << period);
         }
@@ -502,6 +515,13 @@ private:
     }
 
     void NotifyCA() {
+        // While CA is HDRF-throttled, suppress wakeups so ReadyBuffer / CA
+        // mailbox do not grow from spurious TEvNewAsyncInputDataArrived.
+        if (SchedulerThrottled) {
+            DataPendingWhileThrottled = true;
+            return;
+        }
+
         if (!CaNotified) {
             Metrics.InFlyAsyncInputData->Inc();
             CaNotified = true;
@@ -509,6 +529,24 @@ private:
 
         Metrics.AsyncInputDataRate->Inc();
         Send(ComputeActorId, new TEvNewAsyncInputDataArrived(InputIndex));
+    }
+
+    void SetSchedulerThrottled(bool throttled) override {
+        if (SchedulerThrottled == throttled) {
+            return;
+        }
+        SchedulerThrottled = throttled;
+        if (!throttled) {
+            // GetEvents is skipped while throttled, so WaitEvent may have fired and
+            // left SubscribedOnEvent=false with no re-arm. Re-subscribe so SDK-buffered
+            // data after a throttle gap still wakes the CA.
+            const bool hadPending = DataPendingWhileThrottled || !ReadyBuffer.empty();
+            DataPendingWhileThrottled = false;
+            SubscribeOnNextEvent();
+            if (hadPending) {
+                NotifyCA();
+            }
+        }
     }
 
     void Handle(TEvPrivate::TEvPartitionIdleness::TPtr& ev) {
@@ -727,6 +765,8 @@ private:
         if (Reconnected) {
             Reconnected = false;
             ReadyBuffer = std::queue<TReadyBatch>{}; // clear read buffer
+            ReadyBufferUsedBytes = 0;
+            UpdateReadyBufferOccupancyMetric();
         }
 
         i64 usedSpace = 0;
@@ -735,7 +775,9 @@ private:
         }
 
         bool recheckBatch = false;
-        if (freeSpace > 0 && !FinishedByOffsets) {
+        // Do not pull more SDK events while CA is throttled — rely on SDK MaxMemoryUsageBytes
+        // and ReadyBuffer already queued for when quota returns.
+        if (freeSpace > 0 && !FinishedByOffsets && !SchedulerThrottled) {
             if (Clusters.empty()) {
                 StartClusterDiscovery();
             }
@@ -858,7 +900,8 @@ private:
             .AppendTopics(topicReadSettings)
             .MaxMemoryUsageBytes(BufferSize)
             .ReadFromTimestamp(StartingMessageTimestamp)
-            .AutoPartitioningSupport(!SourceParams.GetStopAtCurrentEndOffsets());    // In table mode the query will not fail query by TEndPartitionSessionEvent.
+            .AutoPartitioningSupport(!SourceParams.GetStopAtCurrentEndOffsets())    // In table mode the query will not fail query by TEndPartitionSessionEvent.
+            .DecompressionExecutor(DecompressionExecutor);
 
         if (!WithoutConsumer) {
             settings.ConsumerName(SourceParams.GetConsumerName());
@@ -867,6 +910,10 @@ private:
         }
 
         return settings;
+    }
+
+    TDuration GetCpuTime() override {
+        return TDuration::MicroSeconds(DecompressionCpuMicros->load(std::memory_order_relaxed));
     }
 
     static TPartitionKey MakePartitionKey(const TString& cluster, const NYdb::NTopic::TPartitionSession::TPtr& partitionSession) {
@@ -915,6 +962,10 @@ private:
     };
 
     // must be called with bound allocator
+    void UpdateReadyBufferOccupancyMetric() {
+        Metrics.ReadyBufferBytes->Set(ReadyBufferUsedBytes);
+    }
+
     bool MaybeReturnReadyBatch(TUnboxedValueBatch& buffer, TMaybe<TInstant>& watermark, i64& usedSpace) {
         if (ReadyBuffer.empty()) {
             CheckFinishedByOffsets();
@@ -928,6 +979,8 @@ private:
         watermark = readyBatch.Watermark;
         usedSpace = readyBatch.UsedSpace;
         Metrics.DataRate->Add(readyBatch.UsedSpace);
+        ReadyBufferUsedBytes -= readyBatch.UsedSpace;
+        UpdateReadyBufferOccupancyMetric();
 
         for (const auto& [partitionSession, clusterRanges] : readyBatch.OffsetRanges) {
             const auto& [cluster, ranges] = clusterRanges;
@@ -1093,6 +1146,7 @@ private:
                     auto [item, size] = CreateItem(message);
                     activeBatch.Data.emplace_back(std::move(item));
                     activeBatch.UsedSpace += size;
+                    Self.ReadyBufferUsedBytes += size;
                 }
                 activeBatch.LastWriteTime = partitionTime;
 
@@ -1119,6 +1173,7 @@ private:
                 activeBatch.Watermark = *maybeNewWatermark;
                 SRC_LOG_D("SessionId: " << Self.GetSessionId(Index) << " New watermark " << *maybeNewWatermark << " was generated");
             }
+            Self.UpdateReadyBufferOccupancyMetric();
         }
 
         void operator()(NYdb::NTopic::TSessionClosedEvent& ev) {
@@ -1233,6 +1288,7 @@ private:
     NYdb::NTopic::TDeferredCommit CurrentDeferredCommit;
     std::vector<std::tuple<TString, TPqMetaExtractorLambda>> MetadataFields;
     std::queue<TReadyBatch> ReadyBuffer;
+    i64 ReadyBufferUsedBytes = 0;
     IPqStaticGateway::TPtr PqGateway;
     NThreading::TFuture<std::vector<NYdb::NFederatedTopic::TFederatedTopicClient::TClusterInfo>> AsyncInit;
     ui32 TopicPartitionsCount = 0;
@@ -1240,6 +1296,8 @@ private:
     bool WakeupScheduled = false;
     TInstant LastActiveTime = TInstant::Now();
     bool CaNotified = false;
+    bool SchedulerThrottled = false;
+    bool DataPendingWhileThrottled = false;
     bool FinishedByOffsets = false;
     THashSet<TPartitionKey> FinishedPartitions;
     const TDuration CheckPartitionCountPeriod;
@@ -1249,6 +1307,8 @@ private:
     TMaybe<ui64> EndOffset;
     TMaybe<TInstant> BeginWriteTime;
     TMaybe<TInstant> EndWriteTime;
+    std::shared_ptr<std::atomic<ui64>> DecompressionCpuMicros;
+    NYdb::IExecutor::TPtr DecompressionExecutor;
 };
 
 ui32 ExtractPartitionsFromParams(

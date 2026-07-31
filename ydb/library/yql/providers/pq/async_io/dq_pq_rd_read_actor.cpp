@@ -106,6 +106,8 @@ struct TRowDispatcherReadActorMetrics {
         }
         InFlyGetNextBatch = task->GetCounter("InFlyGetNextBatch");
         InFlyAsyncInputData = task->GetCounter("InFlyAsyncInputData");
+        ReadyBufferBytes = task->GetCounter("ReadyBufferBytes");
+        SdkBufferLimitBytes = task->GetCounter("SdkBufferLimitBytes");
         ReInit = task->GetCounter("ReInit", true);
     }
 
@@ -122,6 +124,8 @@ struct TRowDispatcherReadActorMetrics {
     ::NMonitoring::TDynamicCounterPtr Source;
     ::NMonitoring::TDynamicCounters::TCounterPtr InFlyGetNextBatch;
     ::NMonitoring::TDynamicCounters::TCounterPtr InFlyAsyncInputData;
+    ::NMonitoring::TDynamicCounters::TCounterPtr ReadyBufferBytes;
+    ::NMonitoring::TDynamicCounters::TCounterPtr SdkBufferLimitBytes;
     ::NMonitoring::TDynamicCounters::TCounterPtr ReInit;
 };
 
@@ -278,6 +282,8 @@ private:
     // Set on Parent
     bool ProcessStateScheduled = false;
     bool InFlyAsyncInputData = false;
+    bool SchedulerThrottled = false;
+    bool DataPendingWhileThrottled = false;
     // Set on Parent
     TCounters Counters;
     // Set on Child (except for NotifyCA)
@@ -513,6 +519,7 @@ public:
     TSession* FindAndUpdateSession(const TEventPtr& ev);
     void SendNoSession(const NActors::TActorId& recipient, ui64 cookie);
     void NotifyCA();
+    void SetSchedulerThrottled(bool throttled) override;
     void SchedulePartitionIdlenessCheck(TInstant) override;
     void InitWatermarkTracker() override;
     void SendStartSession(TSession& sessionInfo);
@@ -605,6 +612,10 @@ TDqPqRdReadActor::TDqPqRdReadActor(
         , EnableStreamingQueriesCounters(enableStreamingQueriesCounters)
         , CheckPartitionCountPeriod(checkPartitionCountPeriod)
 {
+    if (Parent == this) {
+        Metrics.SdkBufferLimitBytes->Set(MaxBufferSize);
+        Metrics.ReadyBufferBytes->Set(0);
+    }
     SRC_LOG_I("Start read actor, local row dispatcher " << LocalRowDispatcherActorId.ToString() << ", metadatafields: " << JoinSeq(',', SourceParams.GetMetadataFields())
         << ", partitions: " << JoinSeq(',', GetPartitionsToRead()) << ", skip json errors: " << SourceParams.GetSkipJsonErrors());
     if (Parent != this) {
@@ -868,6 +879,7 @@ i64 TDqPqRdReadActor::GetAsyncInputData(NKikimr::NMiniKQL::TUnboxedValueBatch& b
     } while (freeSpace > 0 && !ReadyBuffer.empty() && watermark.Empty());
 
     ReadyBufferSizeBytes -= usedSpace;
+    Metrics.ReadyBufferBytes->Set(ReadyBufferSizeBytes);
     SRC_LOG_T("Return " << buffer.RowCount() << " rows, watermark " << watermark << ", buffer size " << ReadyBufferSizeBytes << ", free space " << freeSpace << ", result size " << usedSpace);
 
     if (!ReadyBuffer.empty()) {
@@ -1229,6 +1241,7 @@ void TDqPqRdReadActor::Handle(NFq::TEvRowDispatcher::TEvMessageBatch::TPtr& ev) 
         auto size = activeBatch.Data.back().GetSize();
         activeBatch.UsedSpace += size;
         Parent->ReadyBufferSizeBytes += size;
+        Parent->Metrics.ReadyBufferBytes->Set(Parent->ReadyBufferSizeBytes);
 
         nextOffset = *offsets.rbegin() + 1;
         activeBatch.NextOffset = nextOffset;
@@ -1360,7 +1373,7 @@ void TDqPqRdReadActor::Handle(TEvPrivate::TEvProcessState::TPtr&) {
 
 void TDqPqRdReadActor::TrySendGetNextBatch(TSession& sessionInfo) {
     // called on child
-    if (Parent->ReadyBufferSizeBytes > MaxBufferSize) {
+    if (Parent->SchedulerThrottled || Parent->ReadyBufferSizeBytes > MaxBufferSize) {
         return;
     }
     for (auto partitionId : sessionInfo.HasPendingData) {
@@ -1412,12 +1425,41 @@ void TDqPqRdReadActor::SendNoSession(const NActors::TActorId& recipient, ui64 co
 
 void TDqPqRdReadActor::NotifyCA() {
     Y_DEBUG_ABORT_UNLESS(Parent == this); // called on Parent
+    // While CA is HDRF-throttled, suppress wakeups to avoid ReadyBuffer / CA growth.
+    if (SchedulerThrottled) {
+        DataPendingWhileThrottled = true;
+        return;
+    }
     if (!InFlyAsyncInputData) {
         Metrics.InFlyAsyncInputData->Inc();
         InFlyAsyncInputData = true;
     }
     Counters.NotifyCA++;
     Send(ComputeActorId, new TEvNewAsyncInputDataArrived(InputIndex));
+}
+
+void TDqPqRdReadActor::SetSchedulerThrottled(bool throttled) {
+    Y_DEBUG_ABORT_UNLESS(Parent == this); // called on Parent
+    if (SchedulerThrottled == throttled) {
+        return;
+    }
+    SchedulerThrottled = throttled;
+    if (!throttled) {
+        for (auto& cluster : Clusters) {
+            if (cluster.Child) {
+                for (auto& [_, sessionInfo] : cluster.Child->Sessions) {
+                    cluster.Child->TrySendGetNextBatch(sessionInfo);
+                }
+            }
+        }
+        for (auto& [_, sessionInfo] : Sessions) {
+            TrySendGetNextBatch(sessionInfo);
+        }
+        if (DataPendingWhileThrottled) {
+            DataPendingWhileThrottled = false;
+            NotifyCA();
+        }
+    }
 }
 
 void TDqPqRdReadActor::UpdateSessions() {

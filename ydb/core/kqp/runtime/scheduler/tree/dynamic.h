@@ -34,10 +34,13 @@ namespace NKikimr::NKqp::NScheduler::NHdrf::NDynamic {
         std::atomic<ui64> CpuUsage = 0;
         std::atomic<ui64> CpuDemand = 0;
         std::atomic<ui64> CpuThrottle = 0;
+        std::atomic<ui64> CpuIdle = 0;
 
         std::atomic<ui64> CpuBurstUsage = 0;
         std::atomic<ui64> CpuBurstUsageResume = 0;
         std::atomic<ui64> CpuBurstThrottle = 0;
+        std::atomic<ui64> CpuBurstIdle = 0;
+        std::atomic<ui64> CpuThrottleEvents = 0;
         std::atomic<ui64> ReadBurstUsage = 0;
 
         std::atomic<ui64> CpuActualDemand = 0;

@@ -4,6 +4,7 @@ SIZE(MEDIUM)
 
 SRCS(
     dq_pq_info_aggregator_ut.cpp
+    dq_pq_cpu_accounting_executor_ut.cpp
 )
 
 PEERDIR(

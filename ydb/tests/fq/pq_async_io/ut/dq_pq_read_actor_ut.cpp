@@ -549,6 +549,41 @@ Y_UNIT_TEST_SUITE(TDqPqReadActorTest) {
         }
         UNIT_ASSERT_C(failed, "Failure timeout");
     }
+
+    Y_UNIT_TEST_F(SchedulerThrottledSuppressesNotifyAndExposesCpuTime, TFixture) {
+        const TString topicName = "SchedulerThrottleNotify";
+        PQCreateStream(topicName);
+        InitSource(topicName);
+
+        // Prime cluster discovery + WaitEvent subscription.
+        SourceRead<TString>(UVParser);
+
+        CaSetup->Execute([&](TFakeActor& actor) {
+            UNIT_ASSERT(actor.DqAsyncInput);
+            UNIT_ASSERT_GE(actor.DqAsyncInput->GetCpuTime(), TDuration::Zero());
+            actor.DqAsyncInput->SetSchedulerThrottled(true);
+        });
+
+        auto notifyFuture = CaSetup->AsyncInputPromises->NewAsyncInputDataArrived.GetFuture();
+        PQWrite(std::vector{Message0}, topicName);
+
+        // Wait until SDK delivers an event; NotifyCA must stay suppressed.
+        TInstant deadline = Now() + TDuration::Seconds(5);
+        while (Now() < deadline && !notifyFuture.HasValue()) {
+            Sleep(TDuration::MilliSeconds(50));
+        }
+        UNIT_ASSERT_C(!notifyFuture.HasValue(), "NotifyCA must be suppressed while scheduler-throttled");
+
+        CaSetup->Execute([&](TFakeActor& actor) {
+            actor.DqAsyncInput->SetSchedulerThrottled(false);
+        });
+        // Unthrottle re-arms WaitEvent; either pending-flag NotifyCA or WaitEvent wakeup
+        // must deliver TEvNewAsyncInputDataArrived.
+        UNIT_ASSERT_C(notifyFuture.Wait(TDuration::Seconds(10)), "NotifyCA must fire after unthrottle when data was pending");
+
+        auto expected = std::vector{TWatermarkOr<TString>{Message0}};
+        PQRead(expected);
+    }
 }
 
 } // namespace NYql::NDq

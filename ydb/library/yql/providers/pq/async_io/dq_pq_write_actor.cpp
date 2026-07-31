@@ -1,4 +1,5 @@
 #include "dq_pq_write_actor.h"
+#include "dq_pq_cpu_accounting_executor.h"
 #include "probes.h"
 
 #include <ydb/core/base/appdata_fwd.h>
@@ -18,6 +19,7 @@
 #include <ydb/public/sdk/cpp/include/ydb-cpp-sdk/client/topic/client.h>
 #include <ydb/public/sdk/cpp/include/ydb-cpp-sdk/client/federated_topic/federated_topic.h>
 #include <ydb/public/sdk/cpp/include/ydb-cpp-sdk/client/types/credentials/credentials.h>
+#include <ydb/public/sdk/cpp/include/ydb-cpp-sdk/client/types/executor/executor.h>
 
 #include <yql/essentials/minikql/comp_nodes/mkql_saveload.h>
 #include <yql/essentials/minikql/mkql_alloc.h>
@@ -32,6 +34,7 @@
 #include <util/string/builder.h>
 
 #include <algorithm>
+#include <atomic>
 #include <queue>
 #include <variant>
 
@@ -131,6 +134,8 @@ class TDqPqWriteActor : public NActors::TActor<TDqPqWriteActor>, public IDqCompu
             AlreadyWritten = task->GetCounter("AlreadyWritten");
             FirstContinuationTokenMs = task->GetCounter("FirstContinuationTokenMs");
             EgressDataRate = task->GetCounter("EgressDataRate", true);
+            SdkBufferOccupancyBytes = task->GetCounter("SdkBufferOccupancyBytes");
+            SdkBufferLimitBytes = task->GetCounter("SdkBufferLimitBytes");
         }
 
         ~TMetrics() {
@@ -146,6 +151,8 @@ class TDqPqWriteActor : public NActors::TActor<TDqPqWriteActor>, public IDqCompu
         ::NMonitoring::TDynamicCounters::TCounterPtr AlreadyWritten;
         ::NMonitoring::TDynamicCounters::TCounterPtr FirstContinuationTokenMs;
         ::NMonitoring::TDynamicCounters::TCounterPtr EgressDataRate;
+        ::NMonitoring::TDynamicCounters::TCounterPtr SdkBufferOccupancyBytes;
+        ::NMonitoring::TDynamicCounters::TCounterPtr SdkBufferLimitBytes;
     };
 
     struct TAckInfo {
@@ -188,8 +195,15 @@ public:
         , PqGateway(pqGateway)
         , TaskId(taskId)
         , EnableDeduplication(enableStreamingQueriesPqSinkDeduplicationFeatureFlag && SinkParams.GetEnableDeduplication())
+        , CompressionCpuMicros(std::make_shared<std::atomic<ui64>>(0))
+        , CompressionExecutor(std::make_shared<TCpuAccountingExecutor>(
+            NYdb::CreateThreadPoolExecutor(2),
+            CompressionCpuMicros))
     { 
         EgressStats.Level = statsLevel;
+        BufferLimit = FreeSpace;
+        Metrics.SdkBufferLimitBytes->Set(BufferLimit);
+        Metrics.SdkBufferOccupancyBytes->Set(0);
     }
 
     static constexpr char ActorName[] = "DQ_PQ_WRITE_ACTOR";
@@ -240,6 +254,7 @@ public:
 
             FreeSpace -= messageSize;
             Metrics.InFlyData->Inc();
+            Metrics.SdkBufferOccupancyBytes->Set(BufferLimit - FreeSpace);
             Buffer.push(std::move(data));
             return true;
         })) {
@@ -292,6 +307,10 @@ public:
 
     i64 GetFreeSpace() const override {
         return FreeSpace;
+    }
+
+    TDuration GetCpuTime() override {
+        return TDuration::MicroSeconds(CompressionCpuMicros->load(std::memory_order_relaxed));
     }
 
     ui64 GetOutputIndex() const override {
@@ -348,7 +367,8 @@ private:
             .MaxMemoryUsage(FreeSpace)
             .Codec(SinkParams.GetClusterType() == NPq::NProto::DataStreams
                 ? NYdb::NTopic::ECodec::RAW
-                : NYdb::NTopic::ECodec::GZIP);
+                : NYdb::NTopic::ECodec::GZIP)
+            .CompressionExecutor(CompressionExecutor);
 
         settings.DeduplicationEnabled(EnableDeduplication);
         if (EnableDeduplication) {
@@ -502,6 +522,7 @@ private:
                 Self.Metrics.LastAckLatency->Set((TInstant::Now() - ackInfo.StartTime).MilliSeconds());
                 Self.Metrics.InFlyData->Dec();
                 Self.FreeSpace += ackInfo.MessageSize;
+                Self.Metrics.SdkBufferOccupancyBytes->Set(Self.BufferLimit - Self.FreeSpace);
                 ui64 seqNo = ackInfo.SeqNo;        // use seqNo stored on our side because without deduplication we do not specify SeqNo on Write().
                 LOG_T(Self.LogPrefix << "Ack seq no (from WaitingAcks) " << seqNo);
                 Self.WaitingAcks.pop();
@@ -559,6 +580,7 @@ private:
     IDqComputeActorAsyncOutput::ICallbacks* const Callbacks;
     TString LogPrefix;
     i64 FreeSpace = 0;
+    i64 BufferLimit = 0;
     bool Finished = false;
 
     IFederatedTopicClient::TPtr FederatedTopicClient;
@@ -576,6 +598,8 @@ private:
     ui64 TaskId;
     bool Inited = false;
     bool EnableDeduplication = false;
+    std::shared_ptr<std::atomic<ui64>> CompressionCpuMicros;
+    NYdb::IExecutor::TPtr CompressionExecutor;
 };
 
 std::pair<IDqComputeActorAsyncOutput*, NActors::IActor*> CreateDqPqWriteActor(

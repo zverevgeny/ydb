@@ -111,6 +111,10 @@ TPool::TPool(const TPoolId& id, const TIntrusivePtr<TKqpCounters>& counters, con
     Counters->Demand       = group->GetCounter("Demand",       false); // snapshot
     Counters->InFlight     = group->GetCounter("InFlight",     false);
     Counters->Waiting      = group->GetCounter("Waiting",      false);
+    Counters->Idle         = group->GetCounter("Idle",         false);
+    Counters->Active       = group->GetCounter("Active",       false);
+    Counters->IdleTime     = group->GetCounter("IdleTimeUs",   true);
+    Counters->ThrottleEvents = group->GetCounter("ThrottleEvents", true);
     Counters->Queries      = group->GetCounter("Queries",      false);
     Counters->Usage        = group->GetCounter("Usage",        true);
     Counters->UsageResume  = group->GetCounter("UsageResume",  true);
@@ -132,10 +136,14 @@ NSnapshot::TPool* TPool::TakeSnapshot() {
         Counters->Guarantee->Set(GetCpuGuarantee() * 1'000'000);
         Counters->InFlight->Set(CpuUsage * 1'000'000);
         Counters->Waiting->Set(CpuThrottle * 1'000'000);
+        Counters->Idle->Set(CpuIdle * 1'000'000);
+        Counters->Active->Set(CpuDemand * 1'000'000);
         Counters->Usage->Set(CpuBurstUsage);
         Counters->UsageResume->Set(CpuBurstUsageResume);
         Counters->Read->Set(ReadBurstUsage);
         Counters->Throttle->Set(CpuBurstThrottle);
+        Counters->IdleTime->Set(CpuBurstIdle);
+        Counters->ThrottleEvents->Set(CpuThrottleEvents);
     }
 
     if (IsLeaf()) {

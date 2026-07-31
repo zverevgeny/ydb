@@ -273,7 +273,10 @@ protected:
             MkqlMemoryQuota = taskCounters->GetCounter("MkqlMemoryQuota");
             OutputChannelSize = taskCounters->GetCounter("OutputChannelSize");
             SourceCpuTimeMs = taskCounters->GetCounter("SourceCpuTimeMs", true);
+            SinkCpuTimeMs = taskCounters->GetCounter("SinkCpuTimeMs", true);
             InputTransformCpuTimeMs = taskCounters->GetCounter("InputTransformCpuTimeMs", true);
+            SchedulerIdleTimeMs = taskCounters->GetCounter("SchedulerIdleTimeMs", true);
+            SchedulerThrottledMs = taskCounters->GetCounter("SchedulerThrottledMs", true);
         }
     }
 
@@ -397,6 +400,31 @@ protected:
     }
 
     virtual void DoExecuteImpl() = 0;
+
+    // Hook for schedulers to attribute async-source CPU (GetCpuTime) into resource pools.
+    virtual void OnSourceCpuTimeAccounted(TDuration /*delta*/) {
+    }
+
+    // Hook for schedulers to attribute async-sink CPU (GetCpuTime) into resource pools.
+    virtual void OnSinkCpuTimeAccounted(TDuration /*delta*/) {
+    }
+
+    // Called just before ContinueExecute from TEvNewAsyncInputDataArrived so schedulable CA can ExitIdle.
+    virtual void OnBeforeContinueExecuteFromNewAsyncInput() {
+    }
+
+    // Optional hooks for schedulable CA idle/throttle timing metrics.
+    virtual void OnSchedulerIdleTime(TDuration delta) {
+        if (SchedulerIdleTimeMs && delta) {
+            SchedulerIdleTimeMs->Add(delta.MilliSeconds());
+        }
+    }
+
+    virtual void OnSchedulerThrottledTime(TDuration delta) {
+        if (SchedulerThrottledMs && delta) {
+            SchedulerThrottledMs->Add(delta.MilliSeconds());
+        }
+    }
 
     virtual void DoTerminateImpl() {
         MemoryQuota.Reset();
@@ -809,6 +837,16 @@ protected: //TDqComputeActorChannels::ICallbacks
     // void PeerFinished(ui64 channelId) is pure and must be overridded in derived class
 
     void ResumeExecution(EResumeSource source) override final{
+        {
+            auto cpuTimeDelta = TakeSinkCpuTimeDelta();
+            if (SinkCpuTimeMs) {
+                SinkCpuTimeMs->Add(cpuTimeDelta.MilliSeconds());
+            }
+            CpuTimeSpent += cpuTimeDelta;
+            if (cpuTimeDelta) {
+                OnSinkCpuTimeAccounted(cpuTimeDelta);
+            }
+        }
         ContinueExecute(source);
     }
 
@@ -2136,6 +2174,9 @@ protected:
                 SourceCpuTimeMs->Add(cpuTimeDelta.MilliSeconds());
             }
             CpuTimeSpent += cpuTimeDelta;
+            if (cpuTimeDelta) {
+                OnSourceCpuTimeAccounted(cpuTimeDelta);
+            }
         }
         {
             auto cpuTimeDelta = TakeInputTransformCpuTimeDelta();
@@ -2144,6 +2185,7 @@ protected:
             }
             CpuTimeSpent += cpuTimeDelta;
         }
+        OnBeforeContinueExecuteFromNewAsyncInput();
         ContinueExecute(EResumeSource::CANewAsyncInput);
     }
 
@@ -2432,6 +2474,23 @@ public:
         return result;
     }
 
+    TDuration GetSinkCpuTime() const {
+        auto result = TDuration::Zero();
+        for (auto& [outputIndex, sinkInfo] : SinksMap) {
+            if (sinkInfo.AsyncOutput) {
+                result += sinkInfo.AsyncOutput->GetCpuTime();
+            }
+        }
+        return result;
+    }
+
+    TDuration TakeSinkCpuTimeDelta() {
+        auto newSinkCpuTime = GetSinkCpuTime();
+        auto result = newSinkCpuTime - SinkCpuTime;
+        SinkCpuTime = newSinkCpuTime;
+        return result;
+    }
+
     void FillStats(NDqProto::TDqComputeActorStats* dst, bool last) {
         if (RuntimeSettings.CollectNone()) {
             return;
@@ -2442,7 +2501,7 @@ public:
         }
 
         ui64 computeActorElapsedUs = NHPTimer::GetSeconds(ComputeActorElapsedTicks) * 1'000'000ull;
-        dst->SetCpuTimeUs(computeActorElapsedUs + SourceCpuTime.MicroSeconds() + InputTransformCpuTime.MicroSeconds());
+        dst->SetCpuTimeUs(computeActorElapsedUs + SourceCpuTime.MicroSeconds() + SinkCpuTime.MicroSeconds() + InputTransformCpuTime.MicroSeconds());
         dst->SetMemoryUsage(MemoryLimits.MemoryQuotaManager->GetCurrentQuota());
         dst->SetMaxMemoryUsage(MemoryLimits.MemoryQuotaManager->GetMaxMemorySize());
 
@@ -2489,8 +2548,8 @@ public:
                 // Async TR is another actor, summarize CPU usage
                 cpuTimeUs = NHPTimer::GetSeconds(ComputeActorElapsedTicks + TaskRunnerActorElapsedTicks) * 1'000'000ull;
             }
-            // cpuTimeUs does include SourceCpuTime
-            protoTask->SetCpuTimeUs(cpuTimeUs + SourceCpuTime.MicroSeconds() + InputTransformCpuTime.MicroSeconds());
+            // cpuTimeUs does include SourceCpuTime / SinkCpuTime
+            protoTask->SetCpuTimeUs(cpuTimeUs + SourceCpuTime.MicroSeconds() + SinkCpuTime.MicroSeconds() + InputTransformCpuTime.MicroSeconds());
             protoTask->SetSourceCpuTimeUs(SourceCpuTime.MicroSeconds());
 
             ui64 ingressBytes = 0;
@@ -2778,6 +2837,7 @@ protected:
     TDqComputeActorMetrics MetricsReporter;
     NWilson::TSpan ComputeActorSpan;
     TDuration SourceCpuTime;
+    TDuration SinkCpuTime;
     TDuration InputTransformCpuTime;
 private:
     TInstant StartTime;
@@ -2790,7 +2850,10 @@ protected:
     ::NMonitoring::TDynamicCounters::TCounterPtr MkqlMemoryQuota;
     ::NMonitoring::TDynamicCounters::TCounterPtr OutputChannelSize;
     ::NMonitoring::TDynamicCounters::TCounterPtr SourceCpuTimeMs;
+    ::NMonitoring::TDynamicCounters::TCounterPtr SinkCpuTimeMs;
     ::NMonitoring::TDynamicCounters::TCounterPtr InputTransformCpuTimeMs;
+    ::NMonitoring::TDynamicCounters::TCounterPtr SchedulerIdleTimeMs;
+    ::NMonitoring::TDynamicCounters::TCounterPtr SchedulerThrottledMs;
     THolder<NYql::TCounters> Stat;
     TDuration CpuTimeSpent;
 };

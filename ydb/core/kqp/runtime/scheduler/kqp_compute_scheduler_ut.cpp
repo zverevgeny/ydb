@@ -1178,6 +1178,78 @@ Y_UNIT_TEST_SUITE(KqpComputeScheduler) {
         // TODO: check proper counters' values
     }
 
+    Y_UNIT_TEST(SchedulableTaskIdleDropsDemand) {
+        auto counters = MakeIntrusive<TKqpCounters>(MakeIntrusive<NMonitoring::TDynamicCounters>());
+        TOptions options{.DelayParams = kDefaultDelayParams};
+        auto scheduler = std::make_unique<TComputeScheduler>(counters, options);
+        scheduler->SetTotalCpuLimit(4);
+        scheduler->AddOrUpdateDatabase("db1", {});
+        scheduler->AddOrUpdatePool("db1", "pool1", {});
+        auto query = scheduler->AddOrUpdateQuery("db1", "pool1", /*queryId=*/0, {});
+
+        auto task = std::make_shared<TSchedulableTask>(query);
+        UNIT_ASSERT_VALUES_EQUAL(query->CpuDemand.load(), 1u);
+
+        task->EnterIdle();
+        UNIT_ASSERT(task->IsIdle());
+        UNIT_ASSERT_VALUES_EQUAL(query->CpuDemand.load(), 0u);
+        UNIT_ASSERT_VALUES_EQUAL(query->CpuIdle.load(), 1u);
+
+        task->ExitIdle();
+        UNIT_ASSERT(!task->IsIdle());
+        UNIT_ASSERT_VALUES_EQUAL(query->CpuDemand.load(), 1u);
+        UNIT_ASSERT_VALUES_EQUAL(query->CpuIdle.load(), 0u);
+        UNIT_ASSERT(query->CpuBurstIdle.load() > 0u);
+
+        task->AccountBurstUsage(TDuration::MicroSeconds(1500), TSchedulableTask::CPU_DEFAULT);
+        UNIT_ASSERT_VALUES_EQUAL(query->CpuBurstUsage.load(), 1500u);
+    }
+
+    Y_UNIT_TEST(SchedulableTaskThrottleIncrementsEvents) {
+        auto counters = MakeIntrusive<TKqpCounters>(MakeIntrusive<NMonitoring::TDynamicCounters>());
+        TOptions options{.DelayParams = kDefaultDelayParams};
+        auto scheduler = std::make_unique<TComputeScheduler>(counters, options);
+        scheduler->SetTotalCpuLimit(1);
+        scheduler->AddOrUpdateDatabase("db1", {});
+        scheduler->AddOrUpdatePool("db1", "pool1", {});
+        auto query = scheduler->AddOrUpdateQuery("db1", "pool1", /*queryId=*/0, {});
+
+        auto task = std::make_shared<TSchedulableTask>(query);
+        UNIT_ASSERT_VALUES_EQUAL(query->CpuThrottleEvents.load(), 0u);
+
+        task->IncreaseThrottle();
+        UNIT_ASSERT_VALUES_EQUAL(query->CpuThrottle.load(), 1u);
+        UNIT_ASSERT_VALUES_EQUAL(query->CpuThrottleEvents.load(), 1u);
+
+        task->IncreaseThrottle();
+        UNIT_ASSERT_VALUES_EQUAL(query->CpuThrottleEvents.load(), 2u);
+
+        task->DecreaseThrottle();
+        task->DecreaseThrottle();
+        UNIT_ASSERT_VALUES_EQUAL(query->CpuThrottle.load(), 0u);
+        UNIT_ASSERT_VALUES_EQUAL(query->CpuThrottleEvents.load(), 2u); // events are cumulative
+    }
+
+    Y_UNIT_TEST(SchedulableTaskIdleDestructorDoesNotDoubleDecDemand) {
+        auto counters = MakeIntrusive<TKqpCounters>(MakeIntrusive<NMonitoring::TDynamicCounters>());
+        TOptions options{.DelayParams = kDefaultDelayParams};
+        auto scheduler = std::make_unique<TComputeScheduler>(counters, options);
+        scheduler->SetTotalCpuLimit(4);
+        scheduler->AddOrUpdateDatabase("db1", {});
+        scheduler->AddOrUpdatePool("db1", "pool1", {});
+        auto query = scheduler->AddOrUpdateQuery("db1", "pool1", /*queryId=*/0, {});
+
+        {
+            auto task = std::make_shared<TSchedulableTask>(query);
+            UNIT_ASSERT_VALUES_EQUAL(query->CpuDemand.load(), 1u);
+            task->EnterIdle();
+            UNIT_ASSERT_VALUES_EQUAL(query->CpuDemand.load(), 0u);
+        }
+        // Destroyed while idle — Demand must stay 0 (no double-decrement underflow).
+        UNIT_ASSERT_VALUES_EQUAL(query->CpuDemand.load(), 0u);
+        UNIT_ASSERT_VALUES_EQUAL(query->CpuIdle.load(), 0u);
+    }
+
 }
 
 } // namespace NKikimr::NKqp::NScheduler

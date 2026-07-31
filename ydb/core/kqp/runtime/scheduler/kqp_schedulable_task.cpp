@@ -14,7 +14,14 @@ TSchedulableTask::TSchedulableTask(const TQueryPtr& query)
 }
 
 TSchedulableTask::~TSchedulableTask() {
-    --Query->CpuDemand;
+    // EnterIdle already dropped Demand; restore Idle gauge and do not double-decrement Demand.
+    if (Idle) {
+        for (TTreeElement* parent = Query.get(); parent; parent = parent->GetParent()) {
+            --parent->CpuIdle;
+        }
+    } else {
+        --Query->CpuDemand;
+    }
 }
 
 void TSchedulableTask::RegisterForResume(const TActorId& actorId) {
@@ -92,6 +99,49 @@ void TSchedulableTask::DecreaseUsage(const TDuration& burstUsage, EUsageType usa
     }
 }
 
+void TSchedulableTask::AccountBurstUsage(const TDuration& burstUsage, EUsageType usageType) {
+    if (burstUsage == TDuration::Zero()) {
+        return;
+    }
+
+    for (TTreeElement* parent = Query.get(); parent; parent = parent->GetParent()) {
+        switch (usageType) {
+            case CPU_DEFAULT:
+                parent->CpuBurstUsage += burstUsage.MicroSeconds();
+                break;
+            case CPU_RESUMED:
+                parent->CpuBurstUsageResume += burstUsage.MicroSeconds();
+                break;
+            case READ_DEFAULT:
+                parent->ReadBurstUsage += burstUsage.MicroSeconds();
+                break;
+        }
+    }
+}
+
+void TSchedulableTask::EnterIdle() {
+    Y_ENSURE(!Idle);
+    Idle = true;
+    IdleSince = TMonotonic::Now();
+    --Query->CpuDemand;
+    for (TTreeElement* parent = Query.get(); parent; parent = parent->GetParent()) {
+        ++parent->CpuIdle;
+    }
+}
+
+void TSchedulableTask::ExitIdle() {
+    Y_ENSURE(Idle);
+    Idle = false;
+    const auto idleTime = TMonotonic::Now() - IdleSince;
+    IdleSince = TMonotonic::Zero();
+    ++Query->CpuDemand;
+    Query->UpdateActualDemand();
+    for (TTreeElement* parent = Query.get(); parent; parent = parent->GetParent()) {
+        --parent->CpuIdle;
+        parent->CpuBurstIdle += idleTime.MicroSeconds();
+    }
+}
+
 size_t TSchedulableTask::GetSpareUsage() const {
     if (const auto snapshot = Query->GetSnapshot()) {
         auto usage = Query->GetParent()->CpuUsage.load(std::memory_order_relaxed);
@@ -117,6 +167,7 @@ void TSchedulableTask::IncreaseThrottle() {
 
     for (TTreeElement* parent = Query.get(); parent; parent = parent->GetParent()) {
         ++parent->CpuThrottle;
+        ++parent->CpuThrottleEvents;
     }
 }
 

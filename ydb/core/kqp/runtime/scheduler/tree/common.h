@@ -195,6 +195,10 @@ namespace NKikimr::NKqp::NScheduler::NHdrf {
         NMonitoring::TDynamicCounters::TCounterPtr FairShare;
         NMonitoring::TDynamicCounters::TCounterPtr InFlight;
         NMonitoring::TDynamicCounters::TCounterPtr Waiting;
+        NMonitoring::TDynamicCounters::TCounterPtr Idle;
+        NMonitoring::TDynamicCounters::TCounterPtr Active;
+        NMonitoring::TDynamicCounters::TCounterPtr IdleTime;
+        NMonitoring::TDynamicCounters::TCounterPtr ThrottleEvents;
         NMonitoring::TDynamicCounters::TCounterPtr Queries;
         NMonitoring::TDynamicCounters::TCounterPtr Satisfaction;
         NMonitoring::TDynamicCounters::TCounterPtr AdjustedSatisfaction;

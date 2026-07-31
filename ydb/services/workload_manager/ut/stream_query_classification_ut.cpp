@@ -1,5 +1,6 @@
 #include <ydb/services/workload_manager/ut/common/workload_service_ut_common.h>
 
+#include <ydb/core/kqp/counters/kqp_counters.h>
 #include <ydb/core/kqp/ut/common/kqp_ut_common.h>
 #include <ydb/core/tx/scheme_cache/scheme_cache.h>
 
@@ -33,6 +34,100 @@ void CreateTopic(TIntrusivePtr<IYdbSetup> ydb, TString name) {
     UNIT_ASSERT_VALUES_EQUAL_C(result.GetStatus(), NYdb::EStatus::SUCCESS, result.GetIssues().ToOneLineString());
 }
 
+NYdb::TDriver MakeTopicDriver(TIntrusivePtr<IYdbSetup> ydb) {
+    return NYdb::TDriver(NYdb::TDriverConfig()
+        .SetEndpoint(TStringBuilder() << "localhost:" << ydb->GetGrpcPort())
+        .SetDatabase(TStringBuilder() << "/" << ydb->GetSettings().DomainName_));
+}
+
+void WriteTopicMessages(TIntrusivePtr<IYdbSetup> ydb, const TString& topic, const std::vector<TString>& messages) {
+    auto driver = MakeTopicDriver(ydb);
+    NYdb::NTopic::TTopicClient topicClient(driver);
+    auto writeSession = topicClient.CreateSimpleBlockingWriteSession(
+        NYdb::NTopic::TWriteSessionSettings()
+            .Path(topic)
+            .PartitionId(0));
+    for (const auto& message : messages) {
+        UNIT_ASSERT(writeSession->Write(NYdb::NTopic::TWriteMessage(message)));
+    }
+    UNIT_ASSERT(writeSession->Close(TDuration::Seconds(5)));
+    // Non-blocking stop: sync Stop(true) can hang forever in kikimr UT runtimes.
+    driver.Stop(false);
+}
+
+bool TryReadTopicMessages(
+    TIntrusivePtr<IYdbSetup> ydb,
+    const TString& topic,
+    ui64 expectedCount,
+    TDuration timeout)
+{
+    auto driver = MakeTopicDriver(ydb);
+    NYdb::NTopic::TTopicClient topicClient(driver);
+    NYdb::NTopic::TReadSessionSettings readSettings;
+    readSettings
+        .WithoutConsumer()
+        .Decompress(true)
+        .AppendTopics(
+            NYdb::NTopic::TTopicReadSettings(topic)
+                .AppendPartitionIds(0));
+
+    auto readSession = topicClient.CreateReadSession(readSettings);
+    ui64 received = 0;
+    const TInstant deadline = TInstant::Now() + timeout;
+    while (TInstant::Now() < deadline && received < expectedCount) {
+        auto future = readSession->WaitEvent();
+        if (!future.Wait(deadline)) {
+            break;
+        }
+        auto event = readSession->GetEvent(/*block=*/false);
+        if (!event) {
+            continue;
+        }
+        if (auto* data = std::get_if<NYdb::NTopic::TReadSessionEvent::TDataReceivedEvent>(&*event)) {
+            received += data->GetMessages().size();
+        } else if (auto* start = std::get_if<NYdb::NTopic::TReadSessionEvent::TStartPartitionSessionEvent>(&*event)) {
+            start->Confirm(/*readFromCommittedOffset=*/0);
+        } else if (auto* stop = std::get_if<NYdb::NTopic::TReadSessionEvent::TStopPartitionSessionEvent>(&*event)) {
+            stop->Confirm();
+        }
+    }
+    readSession->Close(TDuration::Seconds(1));
+    driver.Stop(false);
+    return received >= expectedCount;
+}
+
+struct TSchedulerPoolCpuSnapshot {
+    i64 Usage = 0;
+    i64 Limit = 0;
+    i64 Queries = 0;
+    i64 IdleTimeUs = 0;
+    i64 ThrottleEvents = 0;
+    i64 UpdateFairShare = 0;
+};
+
+TSchedulerPoolCpuSnapshot ReadSchedulerPoolCpu(TIntrusivePtr<IYdbSetup> ydb, const TString& poolId) {
+    NKqp::TKqpCounters counters(ydb->GetRuntime()->GetAppData().Counters);
+    auto kqp = counters.GetKqpCounters();
+    auto poolGroup = kqp->GetSubgroup("schedulerPool", poolId);
+    return TSchedulerPoolCpuSnapshot{
+        .Usage = poolGroup->GetCounter("Usage", true)->Val(),
+        .Limit = poolGroup->GetCounter("Limit", false)->Val(),
+        .Queries = poolGroup->GetCounter("Queries", false)->Val(),
+        .IdleTimeUs = poolGroup->GetCounter("IdleTimeUs", true)->Val(),
+        .ThrottleEvents = poolGroup->GetCounter("ThrottleEvents", true)->Val(),
+        .UpdateFairShare = kqp->GetCounter("scheduler/UpdateFairShare", true)->Val(),
+    };
+}
+
+void CreateAndWaitStreamingQuery(TIntrusivePtr<IYdbSetup> ydb, const TString& createSql, const TString& poolId) {
+    using namespace std::chrono_literals;
+    const auto& result = ydb->ExecuteQuery(createSql);
+    UNIT_ASSERT_VALUES_EQUAL_C(result.GetStatus(), NYdb::EStatus::SUCCESS, result.GetIssues().ToOneLineString());
+    ydb->WaitPoolState({.DelayedRequests = 0, .RunningRequests = 1}, poolId);
+    std::this_thread::sleep_for(5s);
+    ydb->WaitPoolState({.DelayedRequests = 0, .RunningRequests = 1}, poolId);
+}
+
 }  // anonymous namespace
 
 
@@ -50,14 +145,6 @@ Y_UNIT_TEST_SUITE(StreamingQueryClassification) {
             )" << classifierSql);
         UNIT_ASSERT_VALUES_EQUAL_C(result.GetStatus(), NYdb::EStatus::SUCCESS, result.GetIssues().ToOneLineString());
         ydb->WaitForClassifierPropagation();
-    }
-
-    void CreateAndWaitStreamingQuery(TIntrusivePtr<IYdbSetup> ydb, const TString& createSql, const TString& poolId) {
-        const auto& result = ydb->ExecuteQuery(createSql);
-        UNIT_ASSERT_VALUES_EQUAL_C(result.GetStatus(), NYdb::EStatus::SUCCESS, result.GetIssues().ToOneLineString());
-        ydb->WaitPoolState({.DelayedRequests = 0, .RunningRequests = 1}, poolId);
-        std::this_thread::sleep_for(5s);
-        ydb->WaitPoolState({.DelayedRequests = 0, .RunningRequests = 1}, poolId);
     }
 
     Y_UNIT_TEST(TestStreamingQueryClassificationByPath) {
@@ -144,6 +231,96 @@ Y_UNIT_TEST_SUITE(StreamingQueryClassification) {
         )", explicitPoolId);
 
         ydb->WaitPoolState({.DelayedRequests = 0, .RunningRequests = 0}, classifierPoolId);
+    }
+}
+
+Y_UNIT_TEST_SUITE(StreamingTopicCpuLimit) {
+    /*
+        Scenario:
+        - Resource pool with TOTAL_CPU_LIMIT_PERCENT_PER_NODE = 10.
+        - CREATE STREAMING QUERY that reads from a topic under that pool.
+        - Verify pool CPU cap is configured, topic messages are processed,
+          and scheduler publishes Limit / Usage for the pool (CPU accounting).
+     */
+    Y_UNIT_TEST(TopicReadSqlCpuConsumptionUnderTenPercentPool) {
+        auto ydb = TYdbSetupSettings()
+            .EnableResourcePools(true)
+            .EnableResourcePoolsScheduler(true)
+            .EnableStreamingQueries(true)
+            .EnableHasPredicatesInResourcePoolClassifiers(true)
+            .Create([](auto) {});
+
+        const TString& poolId = "topic_cpu_10pct";
+        CreateTopic(ydb, "cpu10_input");
+        CreateTopic(ydb, "cpu10_output");
+
+        {
+            const auto& result = ydb->ExecuteQuery(TStringBuilder() << R"(
+                CREATE RESOURCE POOL )" << poolId << R"( WITH (
+                    CONCURRENT_QUERY_LIMIT = 10,
+                    QUEUE_SIZE = 100,
+                    TOTAL_CPU_LIMIT_PERCENT_PER_NODE = 10,
+                    QUERY_CPU_LIMIT_PERCENT_PER_NODE = 10
+                );
+            )");
+            UNIT_ASSERT_VALUES_EQUAL_C(result.GetStatus(), NYdb::EStatus::SUCCESS, result.GetIssues().ToOneLineString());
+        }
+
+        {
+            auto desc = ydb->Navigate(TStringBuilder() << ".metadata/workload_manager/pools/" << poolId);
+            UNIT_ASSERT(desc->ResultSet.at(0).ResourcePoolInfo);
+            const auto& properties = desc->ResultSet.at(0).ResourcePoolInfo->Description.GetProperties().GetProperties();
+            UNIT_ASSERT_VALUES_EQUAL_C(
+                properties.at("total_cpu_limit_percent_per_node"), "10",
+                "Pool must be configured with 10% CPU limit");
+        }
+
+        CreateAndWaitStreamingQuery(ydb, TStringBuilder() << R"(
+            CREATE STREAMING QUERY TopicCpuTenPercentQuery WITH (
+                RESOURCE_POOL = ")" << poolId << R"("
+            ) AS DO BEGIN
+                INSERT INTO cpu10_output
+                SELECT * FROM cpu10_input;
+            END DO
+        )", poolId);
+
+        const auto cpuBefore = ReadSchedulerPoolCpu(ydb, poolId);
+
+        constexpr ui64 messageCount = 20;
+        std::vector<TString> messages;
+        messages.reserve(messageCount);
+        for (ui64 i = 0; i < messageCount; ++i) {
+            messages.push_back(TStringBuilder() << "cpu10-msg-" << i);
+        }
+        WriteTopicMessages(ydb, "cpu10_input", messages);
+
+        UNIT_ASSERT_C(
+            TryReadTopicMessages(ydb, "cpu10_output", messageCount, TDuration::Seconds(30)),
+            "Streaming query under 10% CPU pool must process topic messages");
+
+        // Limit / Usage are published by FairShare snapshots. After real topic work
+        // the pool must expose Limit for the 10% cap and some accounted CPU activity.
+        IYdbSetup::WaitFor(TDuration::Seconds(30), "scheduler pool CPU accounting", [&](TString& error) {
+            const auto snap = ReadSchedulerPoolCpu(ydb, poolId);
+            error = TStringBuilder()
+                << "usage=" << snap.Usage
+                << " (before=" << cpuBefore.Usage << ")"
+                << ", limit=" << snap.Limit
+                << ", queries=" << snap.Queries
+                << ", idleTimeUs=" << snap.IdleTimeUs
+                << ", throttleEvents=" << snap.ThrottleEvents
+                << ", updateFairShare=" << snap.UpdateFairShare;
+            // CpuLimit for 10% is at least 1 CPU => Limit counter is CpuLimit * 1e6.
+            const bool limitApplied = snap.Limit >= 1'000'000;
+            const bool usageObserved = snap.Usage > cpuBefore.Usage
+                || snap.IdleTimeUs > cpuBefore.IdleTimeUs
+                || snap.ThrottleEvents > cpuBefore.ThrottleEvents;
+            return limitApplied && usageObserved;
+        });
+
+        const auto cpuAfter = ReadSchedulerPoolCpu(ydb, poolId);
+        UNIT_ASSERT_GE_C(cpuAfter.Limit, 1'000'000, "10% pool must publish Limit >= 1 CPU * 1e6");
+        ydb->WaitPoolState({.DelayedRequests = 0, .RunningRequests = 1}, poolId);
     }
 }
 
