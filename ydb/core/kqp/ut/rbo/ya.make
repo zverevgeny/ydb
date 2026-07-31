@@ -8,6 +8,7 @@ REQUIREMENTS(cpu:2)
 SRCS(
     kqp_rbo_yql_ut.cpp
     kqp_rbo_olap_ut.cpp
+    kqp_rbo_join_on_like_ut.cpp
 )
 
 PEERDIR(
@@ -23,6 +24,7 @@ PEERDIR(
     ydb/core/statistics/ut_common
     yql/essentials/udfs/common/digest
     yql/essentials/udfs/common/hyperloglog
+    yql/essentials/udfs/common/hyperscan
 )
 
 ADDINCL(

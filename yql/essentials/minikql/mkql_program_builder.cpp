@@ -5183,6 +5183,7 @@ TRuntimeNode TProgramBuilder::AsList(const TArrayRef<const TRuntimeNode>& items)
 TRuntimeNode TProgramBuilder::MapJoinCore(TRuntimeNode flow, TRuntimeNode dict, EJoinKind joinKind,
                                           const TArrayRef<const ui32>& leftKeyColumns, const TArrayRef<const ui32>& leftRenames,
                                           const TArrayRef<const ui32>& rightRenames, TType* returnType) {
+    // MKQL_ENSURE(false, "Hey, MapJoinCore");
     MKQL_ENSURE(joinKind == EJoinKind::Inner ||
                     joinKind == EJoinKind::Left ||
                     joinKind == EJoinKind::LeftSemi ||

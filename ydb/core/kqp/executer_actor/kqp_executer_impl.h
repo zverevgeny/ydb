@@ -257,6 +257,21 @@ protected:
                 const auto& source = stage.GetSources(0).GetReadRangesSource();
                 bool isFullScan = false;
                 stageInfo.Meta.PrunedPartitions.emplace_back(PartitionPruner->Prune(source, stageInfo, isFullScan));
+                // DIAGNOSTIC (paired with KQPTASKS_PRUNED_EMPTY_CRASH in kqp_tasks_graph.cpp):
+                // Record every kReadRangesSource stage that gets PrunedPartitions populated
+                // during resolve, so it can be compared against the stage set iterated by
+                // BuildAllTasks. A stage that crashes with empty PrunedPartitions later must
+                // be absent from this list.
+                YDB_LOG_DEBUG_COMP(NKikimrServices::KQP_EXECUTER, "Resolve: populated PrunedPartitions for kReadRangesSource stage",
+                    {"marker", "KQPRESOLVE_PRUNE"},
+                    {"actorId", SelfId()},
+                    {"txId", TxId},
+                    {"stageTxId", stageInfo.Id.TxId},
+                    {"stageId", stageInfo.Id.StageId},
+                    {"tablePath", stageInfo.Meta.TablePath},
+                    {"sourceTablePath", source.GetTable().GetPath()},
+                    {"prunedShards", stageInfo.Meta.PrunedPartitions.back().size()},
+                    {"traceId", TraceId()});
                 for (const auto& [shardId, _] : stageInfo.Meta.PrunedPartitions.back()) {
                     shardIds.insert(shardId);
                 }

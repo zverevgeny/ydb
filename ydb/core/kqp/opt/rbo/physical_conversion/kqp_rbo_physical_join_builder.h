@@ -23,6 +23,10 @@ public:
 private:
     TExprNode::TPtr BuildPhysicalJoin(TExprNode::TPtr leftInput, TExprNode::TPtr rightInput, bool useBlockHashJoins, const TTypeAnnotationContext& typesCtx);
     TExprNode::TPtr BuildCrossJoin(TExprNode::TPtr leftInput, TExprNode::TPtr rightInput);
+    // Automaton-based LIKE join: builds one combined Hyperscan automaton from all
+    // right-side LIKE masks and probes each left row once, emitting one output row
+    // per (left row, matched mask) pair. Used when Join->IsLikeJoin is set.
+    TExprNode::TPtr BuildLikeJoin(TExprNode::TPtr leftInput, TExprNode::TPtr rightInput);
     void PrepareJoinKeys(TVector<TString>& leftJoinKeys, TVector<TString>& rightJoinKeys, TModifyKeysList& remapLeft, TModifyKeysList& remapRight,
                          THashMap<TString, TString>& leftColumnRemap, THashMap<TString, TString>& rightColumnRemap, TVector<TString>& leftJoinKeyRenames,
                          TVector<TString>& rightJoinKeyRenames, const TStructExprType* leftInputType, const TStructExprType* rightInputType, const bool outer,

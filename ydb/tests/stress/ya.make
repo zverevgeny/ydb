@@ -6,6 +6,7 @@ RECURSE(
     ctas
     federated_queries
     fulltext_workload
+    join_like_workload
     kafka
     kafka_serverless
     kv

@@ -107,6 +107,155 @@ TExprNode::TPtr TPhysicalJoinBuilder::BuildCrossJoin(TExprNode::TPtr leftInput, 
     // clang-format on
 }
 
+// Automaton-based LIKE join.
+//
+// Semantics mirror BuildCrossJoin (materialize the whole right side, then join
+// every left row against it), but instead of emitting the full cross product and
+// filtering each pair with a per-pair Re2.Match, we build ONE combined Hyperscan
+// automaton from all right-side LIKE masks and probe each left row a single time.
+//
+// The right side is condensed into a single materialized list `rightAsList`.
+// From it we derive:
+//   * patternList = OrderedMap(rightAsList, r -> Re2.PatternFromLike(r.<mask>))
+//     which becomes the runtime RunConfig (List<String>) of the
+//     Hyperscan.MultiMatchIndices UDF (anchored ^...$ matching == full-string
+//     LIKE semantics).
+//   * indexDict = ToIndexDict(rightAsList) : Dict<ui64, rightRow>, so a matched
+//     index can be mapped back to its originating right row.
+//
+// For each left row we compute the list of matched pattern indices with a single
+// automaton pass, then emit one output struct per matched index (left columns +
+// the corresponding right columns). Left rows that match nothing produce no rows
+// here; the outer LEFT re-join installed by TInlineJoinFiltersRule restores their
+// NULL-filled output.
+TExprNode::TPtr TPhysicalJoinBuilder::BuildLikeJoin(TExprNode::TPtr leftInput, TExprNode::TPtr rightInput) {
+    const auto leftIUs = NPhysicalConvertionUtils::GetLiveInputIUs(*Join, 0);
+    const auto rightIUs = NPhysicalConvertionUtils::GetLiveInputIUs(*Join, 1);
+
+    leftInput = NPhysicalConvertionUtils::ExtractMembers(leftInput, Ctx, leftIUs);
+    rightInput = NPhysicalConvertionUtils::ExtractMembers(rightInput, Ctx, rightIUs);
+
+    const auto probeCol = Join->LikeProbeColumn.GetFullName();
+    const auto patternCol = Join->LikePatternColumn.GetFullName();
+
+    YQL_CLOG(TRACE, CoreDq) << "Converting LIKE Join, probe: " << probeCol << ", pattern: " << patternCol;
+
+    // clang-format off
+    auto flatMap = Ctx.Builder(Pos)
+        .Callable("FlatMap")
+            // Condense the right input into a single-element stream carrying the
+            // whole right side as one materializable List (a stream can only be
+            // iterated once; a List can be reused for every left row).
+            .Callable(0, "Condense1")
+                .Callable(0, "ToFlow")
+                    .Add(0, rightInput)
+                .Seal()
+                .Lambda(1)
+                    .Param("itemArg")
+                    .Callable("AsList")
+                        .Arg(0, "itemArg")
+                    .Seal()
+                .Seal()
+                .Lambda(2)
+                    .Param("item")
+                    .Param("state")
+                    .Callable("Bool")
+                        .Atom(0, "false")
+                    .Seal()
+                .Seal()
+                .Lambda(3)
+                    .Param("item")
+                    .Param("state")
+                    .Callable("Append")
+                        .Arg(0, "state")
+                        .Arg(1, "item")
+                    .Seal()
+                .Seal()
+            .Seal()
+            .Lambda(1)
+                .Param("rightAsList")
+                .Callable("FlatMap")
+                    .Add(0, leftInput)
+                    .Lambda(1)
+                        .Param("leftRow")
+                        .Callable("OrderedMap")
+                            // Single automaton pass: matched pattern indices for this left row.
+                            .Callable(0, "Apply")
+                                .Callable(0, "Udf")
+                                    .Atom(0, "Hyperscan.MultiMatchIndices")
+                                    // RunConfig: the List<String> of Re2 patterns compiled from
+                                    // every right-side LIKE mask, in right-list order.
+                                    .Callable(1, "OrderedMap")
+                                        .Arg(0, "rightAsList")
+                                        .Lambda(1)
+                                            .Param("patRow")
+                                            .Callable("Apply")
+                                                .Callable(0, "Udf")
+                                                    .Atom(0, "Re2.PatternFromLike")
+                                                .Seal()
+                                                .Callable(1, "Member")
+                                                    .Arg(0, "patRow")
+                                                    .Atom(1, patternCol)
+                                                .Seal()
+                                            .Seal()
+                                        .Seal()
+                                    .Seal()
+                                .Seal()
+                                .Callable(1, "Member")
+                                    .Arg(0, "leftRow")
+                                    .Atom(1, probeCol)
+                                .Seal()
+                            .Seal()
+                            .Lambda(1)
+                                .Param("idx")
+                                .Callable("AsStruct")
+                                    .Do([&](TExprNodeBuilder& parent) -> TExprNodeBuilder& {
+                                        ui32 i = 0;
+                                        for (const auto& iu : leftIUs) {
+                                            const auto name = iu.GetFullName();
+                                            parent.List(i++)
+                                                .Atom(0, name)
+                                                .Callable(1, "Member")
+                                                    .Arg(0, "leftRow")
+                                                    .Atom(1, name)
+                                                .Seal()
+                                            .Seal();
+                                        }
+                                        for (const auto& iu : rightIUs) {
+                                            const auto name = iu.GetFullName();
+                                            // Map the matched index back to the originating right row.
+                                            parent.List(i++)
+                                                .Atom(0, name)
+                                                .Callable(1, "Member")
+                                                    .Callable(0, "Unwrap")
+                                                        .Callable(0, "Lookup")
+                                                            .Callable(0, "ToIndexDict")
+                                                                .Arg(0, "rightAsList")
+                                                            .Seal()
+                                                            .Arg(1, "idx")
+                                                        .Seal()
+                                                    .Seal()
+                                                    .Atom(1, name)
+                                                .Seal()
+                                            .Seal();
+                                        }
+                                        return parent;
+                                    })
+                                .Seal()
+                            .Seal()
+                        .Seal()
+                    .Seal()
+                .Seal()
+            .Seal()
+        .Seal()
+    .Build();
+    // clang-format on
+
+    return Build<TCoFromFlow>(Ctx, Pos)
+        .Input(flatMap)
+    .Done().Ptr();
+}
+
 TExprNode::TPtr TPhysicalJoinBuilder::PrepareJoinSide(TExprNode::TPtr input, const TVector<TInfoUnit>& colNames, TVector<TString>& joinKeys,
                                                       const TModifyKeysList& remap, const bool filterNulls) {
     // clang-format off
@@ -587,7 +736,15 @@ TExprNode::TPtr TPhysicalJoinBuilder::BuildPhysicalJoin(TExprNode::TPtr leftInpu
 
 TExprNode::TPtr TPhysicalJoinBuilder::BuildPhysicalOp(TExprNode::TPtr leftInput, TExprNode::TPtr rightInput, bool useBlockHashJoin, const TTypeAnnotationContext& typesCtx) {
     const auto joinKind = to_lower(Join->JoinKind);
+    if (Join->IsLikeJoin) {
+        return BuildLikeJoin(leftInput, rightInput);
+    }
     if (joinKind == "cross") {
+        return BuildCrossJoin(leftInput, rightInput);
+    }
+    if (Join->JoinKeys.empty()) {
+        Y_ENSURE(joinKind == "cross" || joinKind == "inner",
+                 TStringBuilder() << "Join without equi-keys is only supported for Cross/Inner, got: " << Join->JoinKind);
         return BuildCrossJoin(leftInput, rightInput);
     }
 

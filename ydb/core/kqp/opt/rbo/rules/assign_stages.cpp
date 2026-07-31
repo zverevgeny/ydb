@@ -94,9 +94,12 @@ bool TAssignStagesRule::MatchAndApply(TIntrusivePtr<IOperator>& input, TRBOConte
 
         FinalizeJoinPhysicalProps(*join, ctx);
 
-        // For cross-join or map join we build a stage with map and broadcast connections
+        // For cross-join, map join, or an automaton-based LIKE join we build a
+        // stage with map (left) and broadcast (right) connections: the whole
+        // right side must be materialized to build the combined Hyperscan
+        // automaton / cross product.
         // FIXME: We assume that right side is small one, map join also can work with hash shuffle connections.
-        if (join->JoinKind == "Cross" || join->Props.JoinAlgo == EJoinAlgoType::MapJoin) {
+        if (join->JoinKind == "Cross" || join->IsLikeJoin || join->Props.JoinAlgo == EJoinAlgoType::MapJoin) {
             props.StageGraph.Connect(leftStage, newStageId, MakeIntrusive<TMapConnection>(leftOutputIndex));
             props.StageGraph.Connect(rightStage, newStageId, MakeIntrusive<TBroadcastConnection>(rightOutputIndex));
         }

@@ -150,6 +150,18 @@ public:
                 );
 
             if (stage.SourcesSize() > 0 && stage.GetSources(0).GetTypeCase() == NKqpProto::TKqpSource::kReadRangesSource) {
+                // DIAGNOSTIC: Log if PrunedPartitions is empty at this site (GetSimplifiedUseFollowers).
+                // This is a separate code path from the crash site in CountScanTasksFromSource but
+                // can also hit .at(0) on an empty vector. Log context before the access.
+                if (stageInfo.Meta.PrunedPartitions.empty()) {
+                    YDB_LOG_ERROR("CRASH DIAGNOSTIC: PrunedPartitions is EMPTY for kReadRangesSource stage "
+                        "in GetSimplifiedUseFollowers - std::out_of_range about to be thrown at .at(0).",
+                        {"marker", "KQPDATAPRUNED_EMPTY_FOLLOWERS"},
+                        {"txId", stageInfo.Id.TxId},
+                        {"stageId", stageInfo.Id.StageId},
+                        {"tablePath", stageInfo.Meta.TablePath},
+                        {"sourceTablePath", stage.GetSources(0).GetReadRangesSource().GetTable().GetPath()});
+                }
                 const auto& source = stage.GetSources(0).GetReadRangesSource();
                 const auto& partitions = stageInfo.Meta.PrunedPartitions.at(0);
                 bool isSequentialInFlight = source.GetSequentialInFlightShards() > 0 && partitions.size() > source.GetSequentialInFlightShards();
@@ -827,8 +839,9 @@ private:
                 for (const auto& [stageId, stageInfo] : TasksGraph.GetStagesInfo()) {
                     YQL_ENSURE(stageId == stageInfo.Id);
                     const auto& stage = stageInfo.Meta.GetStage(stageInfo.Id);
-                    if (stage.SourcesSize() > 0 && stage.GetSources(0).GetTypeCase() == NKqpProto::TKqpSource::kReadRangesSource) {
-                        const auto& partitions = stageInfo.Meta.PrunedPartitions.at(0);
+                    if (stage.SourcesSize() > 0 && stage.GetSources(0).GetTypeCase() == NKqpProto::TKqpSource::kReadRangesSource
+                        && !stageInfo.Meta.PrunedPartitions.empty()) {
+                        const auto& partitions = stageInfo.Meta.PrunedPartitions.front();
                         for (const auto& [shardId, _] : partitions) {
                             shardIds.insert(shardId);
                         }

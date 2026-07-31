@@ -726,6 +726,14 @@ TVector<TInfoUnit> TOpJoin::GetUsedIUs(TPlanProps& props) {
         result.insert(result.end(), filterIUs.begin(), filterIUs.end());
     }
 
+    // An automaton-based LIKE join carries no explicit JoinFilters (the predicate
+    // is lowered to a Hyperscan pass in physical conversion), so the probe/pattern
+    // columns must be reported here to keep them live through liveness analysis.
+    if (IsLikeJoin) {
+        result.push_back(LikeProbeColumn);
+        result.push_back(LikePatternColumn);
+    }
+
     return result;
 }
 

@@ -236,6 +236,112 @@ private:
     TRegExMatch Fallback_;
 };
 
+// Runtime-pattern multi-matcher: the set of patterns is provided as a runtime
+// RunConfig (List<String>), a single Hyperscan database is compiled once at
+// construction, and Run() returns the list of matched pattern indices for each
+// probed string in a single automaton pass. Unlike THyperscanMatch::MULTI, the
+// pattern count is NOT baked into the return type, so an arbitrary, runtime-known
+// number of patterns is supported.
+class THyperscanMultiMatchIndices: public THyperscanUdfBase {
+public:
+    class TFactory: public THyperscanUdfBase {
+    public:
+        TFactory(TSourcePosition pos, bool surroundMode)
+            : Pos_(pos)
+            , SurroundMode_(surroundMode)
+        {
+        }
+
+    private:
+        TUnboxedValue Run(
+            const IValueBuilder*,
+            const TUnboxedValuePod* args) const override {
+            return TUnboxedValuePod(new THyperscanMultiMatchIndices(args[0], SurroundMode_, Pos_));
+        }
+
+        TSourcePosition Pos_;
+        bool SurroundMode_;
+    };
+
+    static const TStringRef& Name(bool isGrep) {
+        static auto Match = TStringRef::Of("MultiMatchIndices");
+        static auto Grep = TStringRef::Of("MultiGrepIndices");
+        return isGrep ? Grep : Match;
+    }
+
+    THyperscanMultiMatchIndices(const TUnboxedValuePod& runConfig, bool surroundMode, TSourcePosition pos)
+        : Pos_(pos)
+    {
+        try {
+            std::vector<TString> regexes;
+            TVector<const char*> cregexes;
+            TVector<TOptions> flags;
+            TVector<TOptions> ids;
+
+            const auto listIt = runConfig.GetListIterator();
+            for (TUnboxedValue item; listIt.Next(item);) {
+                TString regex(item.AsStringRef());
+
+                TOptions opt = 0;
+                SetCommonOptions(regex, opt);
+
+                if (!surroundMode) {
+                    regex = TStringBuilder() << '^' << regex << '$';
+                }
+
+                regexes.emplace_back(std::move(regex));
+                flags.emplace_back(opt);
+            }
+
+            PatternCount_ = regexes.size();
+
+            std::transform(regexes.cbegin(), regexes.cend(), std::back_inserter(cregexes), std::bind(&TString::c_str, std::placeholders::_1));
+            ids.resize(regexes.size());
+            std::iota(ids.begin(), ids.end(), 0);
+
+            if (PatternCount_ > 0) {
+                Database_ = CompileMulti(cregexes, flags, ids);
+                Scratch_ = MakeScratch(Database_);
+            }
+        } catch (const std::exception& e) {
+            UdfTerminate((TStringBuilder() << Pos_ << " " << e.what()).c_str());
+        }
+    }
+
+private:
+    TUnboxedValue Run(
+        const IValueBuilder* valueBuilder,
+        const TUnboxedValuePod* args) const final try {
+        if (!args[0] || PatternCount_ == 0) {
+            return valueBuilder->NewEmptyList();
+        }
+
+        // XXX: StringRef data might not be a NTBS. Explicitly copy the given
+        // argument string and append the NUL terminator to it.
+        const TString input(args[0].AsStringRef());
+        std::vector<bool> matched(PatternCount_, false);
+        auto callback = [&matched](TOptions id, ui64 /* from */, ui64 /* to */) {
+            matched[id] = true;
+        };
+        Scan(Database_, Scratch_, input, callback);
+
+        auto listBuilder = valueBuilder->NewListBuilder();
+        for (size_t i = 0; i < PatternCount_; ++i) {
+            if (matched[i]) {
+                listBuilder->Add(TUnboxedValuePod(static_cast<ui64>(i)));
+            }
+        }
+        return listBuilder->Build();
+    } catch (const std::exception& e) {
+        UdfTerminate((TStringBuilder() << Pos_ << " " << e.what()).c_str());
+    }
+
+    const TSourcePosition Pos_;
+    size_t PatternCount_ = 0;
+    TDatabase Database_;
+    TScratch Scratch_;
+};
+
 class THyperscanCapture: public THyperscanUdfBase {
 public:
     class TFactory: public THyperscanUdfBase {
@@ -410,6 +516,8 @@ public:
         auto multiMatch = sink.Add(THyperscanMatch::Name(/*isGrep=*/false, THyperscanMatch::EMode::MULTI));
         multiMatch->SetTypeAwareness();
         multiMatch->SetPolyArgs(MultiPolyArgs);
+        sink.Add(THyperscanMultiMatchIndices::Name(/*isGrep=*/true));
+        sink.Add(THyperscanMultiMatchIndices::Name(/*isGrep=*/false));
         sink.Add(THyperscanCapture::Name());
         sink.Add(THyperscanReplace::Name());
     }
@@ -430,6 +538,8 @@ public:
             bool isBacktrackingGrep = (THyperscanMatch::Name(/*isGrep=*/true, THyperscanMatch::EMode::BACKTRACKING) == name);
             bool isMultiMatch = (THyperscanMatch::Name(/*isGrep=*/false, THyperscanMatch::EMode::MULTI) == name);
             bool isMultiGrep = (THyperscanMatch::Name(/*isGrep=*/true, THyperscanMatch::EMode::MULTI) == name);
+            bool isMultiMatchIndices = (THyperscanMultiMatchIndices::Name(/*isGrep=*/false) == name);
+            bool isMultiGrepIndices = (THyperscanMultiMatchIndices::Name(/*isGrep=*/true) == name);
 
             if (isMatch || isGrep) {
                 builder.SimpleSignature<bool(TOptional<char*>)>()
@@ -459,6 +569,15 @@ public:
 
                 if (!typesOnly) {
                     builder.Implementation(new THyperscanMatch::TFactory(builder.GetSourcePosition(), isMultiGrep, THyperscanMatch::EMode::MULTI, regexpCount));
+                }
+            } else if (isMultiMatchIndices || isMultiGrepIndices) {
+                // RunConfig is a runtime list of patterns; the result is the
+                // list of indices (into that pattern list) that matched.
+                builder.SimpleSignature<TListType<ui64>(TOptional<char*>)>()
+                    .RunConfig<TListType<char*>>();
+
+                if (!typesOnly) {
+                    builder.Implementation(new THyperscanMultiMatchIndices::TFactory(builder.GetSourcePosition(), isMultiGrepIndices));
                 }
             } else if (THyperscanCapture::Name() == name) {
                 builder.SimpleSignature<TOptional<char*>(TOptional<char*>)>()

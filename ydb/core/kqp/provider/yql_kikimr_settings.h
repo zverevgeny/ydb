@@ -99,6 +99,11 @@ public:
     NCommon::TConfSetting<bool, Static> OptCreateStageForAggregation;
     NCommon::TConfSetting<bool, Static> OptValidateStreamingConstraints;
     NCommon::TConfSetting<bool, Static> OptFallbackToLegacyOptimizer;
+    // When set, LEFT JOIN ... ON <probe> LIKE <mask> is lowered to a single
+    // Hyperscan multi-pattern automaton pass. When unset (default), the join
+    // falls back to the standard cross-join followed by a per-row filter
+    // (the double loop).
+    NCommon::TConfSetting<bool, Static> EnableLikeJoinHyperscan;
 
     // Use CostBasedOptimizationLevel for internal usage. This is a dummy flag that is mapped to the optimization level during parsing.
     NCommon::TConfSetting<TString, Static> CostBasedOptimization;

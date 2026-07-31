@@ -658,6 +658,17 @@ public:
     TVector<std::pair<TInfoUnit, TInfoUnit>> JoinKeys;
     TVector<TExpression> JoinFilters;
 
+    // Automaton-based LIKE join marker. When set, physical conversion emits a
+    // single combined Hyperscan automaton built from all right-side pattern
+    // columns and probes each left row once, instead of a nested-loops cross
+    // join followed by a per-pair Re2 filter.
+    //
+    // LikeProbeColumn  - left-side column being matched (e.g. e.name)
+    // LikePatternColumn- right-side column holding the SQL LIKE mask (e.g. l.mask)
+    bool IsLikeJoin = false;
+    TInfoUnit LikeProbeColumn;
+    TInfoUnit LikePatternColumn;
+
 protected:
     void ComputeOutputIUs() override;
 };

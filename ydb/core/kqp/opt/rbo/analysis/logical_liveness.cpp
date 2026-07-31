@@ -238,6 +238,18 @@ void TOpJoin::PropagateLiveness(ILivenessContext& ctx) {
         AddInfoUnit(rightLive, rightKey);
     }
 
+    // An automaton-based LIKE join has no JoinFilters (the predicate becomes a
+    // Hyperscan pass during physical conversion), so its probe (left) and
+    // pattern (right) columns are declared live explicitly.
+    if (IsLikeJoin) {
+        if (leftOutput.contains(LikeProbeColumn)) {
+            AddInfoUnit(leftLive, LikeProbeColumn);
+        }
+        if (rightOutput.contains(LikePatternColumn)) {
+            AddInfoUnit(rightLive, LikePatternColumn);
+        }
+    }
+
     for (const auto& filter : JoinFilters) {
         TInfoUnitSet filterDeps;
         ctx.AddExpressionDeps(filter, filterDeps);

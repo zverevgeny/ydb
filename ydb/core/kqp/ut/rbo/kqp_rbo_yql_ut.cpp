@@ -11119,6 +11119,31 @@ foo_0.join_id = foo_6.id AND foo_0.join_id = foo_7.id AND foo_0.join_id = foo_8.
         }
     }
 
+    Y_UNIT_TEST(NullOpRootPassthrough) {
+        NKikimrConfig::TAppConfig appConfig;
+        appConfig.MutableLogConfig()->SetDefaultLevel(NActors::NLog::PRI_ERROR);
+        appConfig.MutableTableServiceConfig()->SetEnableNewRBO(true);
+        TKikimrRunner kikimr(NKqp::TKikimrSettings(appConfig).SetWithSampleTables(false));
+        auto queryClient = kikimr.GetQueryClient();
+        auto querySession = queryClient.GetSession().GetValueSync().GetSession();
+
+        querySession.ExecuteQuery(R"(
+            CREATE TABLE `/Root/t` (
+                id	Int64	NOT NULL,
+                val	String,
+                primary key(id)
+            );
+        )", NYdb::NQuery::TTxControl::NoTx(), {}).GetValueSync();
+
+        const auto result = querySession.ExecuteQuery(R"(
+            SELECT * FROM `/Root/t`
+        )",
+            NYdb::NQuery::TTxControl::NoTx(),
+            NYdb::NQuery::TExecuteQuerySettings().ExecMode(NQuery::EExecMode::Explain)
+        ).ExtractValueSync();
+        UNIT_ASSERT_VALUES_EQUAL(result.GetStatus(), EStatus::SUCCESS);
+    }
+
 }
 
 } // namespace NKqp
