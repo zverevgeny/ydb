@@ -37,7 +37,7 @@ protected:
         mutables.DeferWideFieldsInit(inputWidth, UsedInputs);
     }
 
-#ifndef MKQL_DISABLE_CODEGEN
+#if 0 // TODO(T5): Re-enable LLVM codegen for lambda-based MapJoinCore
     Value* GenMakeKeysTuple(Value* keysPtr, const ICodegeneratorInlineWideNode::TGettersList& getters, const TCodegenContext& ctx, BasicBlock*& block) const {
         auto& context = ctx.Codegen.GetContext();
         const auto zero = ConstantInt::get(Type::getInt128Ty(context), 0);
@@ -320,7 +320,7 @@ public:
         this->NullRightStruct(output);
         return EFetchResult::One;
     }
-#ifndef MKQL_DISABLE_CODEGEN
+#if 0 // TODO(T5): Re-enable LLVM codegen for lambda-based MapJoinCore
     ICodegeneratorInlineWideNode::TGenerateResult DoGenGetValues(const TCodegenContext& ctx, Value* lookupPtr, BasicBlock*& block) const {
         MKQL_ENSURE(!this->Dict->IsTemporaryValue(), "Dict can't be temporary");
 
@@ -500,7 +500,7 @@ public:
             }
         }
     }
-#ifndef MKQL_DISABLE_CODEGEN
+#if 0 // TODO(T5): Re-enable LLVM codegen for lambda-based MapJoinCore
     ICodegeneratorInlineWideNode::TGenerateResult DoGenGetValues(const TCodegenContext& ctx, Value* iteraratorPtr, Value* itemPtr, BasicBlock*& block) const {
         MKQL_ENSURE(!this->Dict->IsTemporaryValue(), "Dict can't be temporary");
         auto& context = ctx.Codegen.GetContext();
@@ -671,19 +671,27 @@ template <bool IsTuple>
 class TMapJoinCoreWrapperBase {
 protected:
     TMapJoinCoreWrapperBase(TComputationMutables& mutables, std::vector<TFunctionDescriptor>&& leftKeyConverters,
-                            TDictType* dictType, std::vector<EValueRepresentation>&& outputRepresentations, std::vector<ui32>&& leftKeyColumns,
-                            std::vector<ui32>&& leftRenames, std::vector<ui32>&& rightRenames, IComputationNode* stream, IComputationNode* dict)
+                            TType* keyType, std::vector<EValueRepresentation>&& outputRepresentations, std::vector<ui32>&& leftKeyColumns,
+                            std::vector<ui32>&& leftRenames, std::vector<ui32>&& rightRenames, IComputationNode* stream,
+                            IComputationExternalNode* keyArg, IComputationNode* lookupBody)
         : LeftKeyConverters(std::move(leftKeyConverters))
-        , DictType(dictType)
+        , KeyType(keyType)
         , OutputRepresentations(std::move(outputRepresentations))
         , LeftKeyColumns(std::move(leftKeyColumns))
         , LeftRenames(std::move(leftRenames))
         , RightRenames(std::move(rightRenames))
         , Stream(stream)
-        , Dict(dict)
+        , KeyArg(keyArg)
+        , LookupBody(lookupBody)
         , ResStruct(mutables)
         , KeyTuple(mutables)
     {
+    }
+
+    // Invoke the right-side lambda with `key` and return the result.
+    NUdf::TUnboxedValue LookupKey(TComputationContext& ctx, NUdf::TUnboxedValue&& key) const {
+        KeyArg->SetValue(ctx, std::move(key));
+        return LookupBody->GetValue(ctx);
     }
 
     static void FillStruct(const NUdf::TUnboxedValue& structObj, NUdf::TUnboxedValue* items, const std::vector<ui32>& renames) {
@@ -737,7 +745,7 @@ protected:
             return converter ? NUdf::TUnboxedValue(converter(&value)) : value;
         }
     }
-#ifndef MKQL_DISABLE_CODEGEN
+#if 0 // TODO(T5 stage 2): Re-enable LLVM codegen for lambda-based MapJoinCore
     void GenFillLeftStruct(Value* left, Value* items, Type* arrayType, const TCodegenContext& ctx, BasicBlock*& block) const {
         auto& context = ctx.Codegen.GetContext();
         const auto idxType = Type::getInt32Ty(context);
@@ -931,13 +939,14 @@ protected:
 #endif
 
     const std::vector<TFunctionDescriptor> LeftKeyConverters;
-    TDictType* const DictType;
+    TType* const KeyType;
     const std::vector<EValueRepresentation> OutputRepresentations;
     const std::vector<ui32> LeftKeyColumns;
     const std::vector<ui32> LeftRenames;
     const std::vector<ui32> RightRenames;
     IComputationNode* const Stream;
-    IComputationNode* const Dict;
+    IComputationExternalNode* const KeyArg;
+    IComputationNode* const LookupBody;
 
     const TContainerCacheOnContext ResStruct;
     const TContainerCacheOnContext KeyTuple;
@@ -960,28 +969,28 @@ class TMapJoinCoreFlowWrapper: public TMapJoinCoreWrapperBase<IsTuple>, public s
 
 public:
     TMapJoinCoreFlowWrapper(TComputationMutables& mutables, EValueRepresentation kind, std::vector<TFunctionDescriptor>&& leftKeyConverters,
-                            TDictType* dictType, std::vector<EValueRepresentation>&& outputRepresentations, std::vector<ui32>&& leftKeyColumns,
+                            TType* keyType, std::vector<EValueRepresentation>&& outputRepresentations, std::vector<ui32>&& leftKeyColumns,
                             std::vector<ui32>&& leftRenames, std::vector<ui32>&& rightRenames,
-                            IComputationNode* flow, IComputationNode* dict)
-        : TMapJoinCoreWrapperBase<IsTuple>(mutables, std::move(leftKeyConverters), dictType, std::move(outputRepresentations),
-                                           std::move(leftKeyColumns), std::move(leftRenames), std::move(rightRenames), flow, dict)
+                            IComputationNode* flow, IComputationExternalNode* keyArg, IComputationNode* lookupBody)
+        : TMapJoinCoreWrapperBase<IsTuple>(mutables, std::move(leftKeyConverters), keyType, std::move(outputRepresentations),
+                                           std::move(leftKeyColumns), std::move(leftRenames), std::move(rightRenames), flow, keyArg, lookupBody)
         , TBaseComputation(mutables, flow, kind)
     {
     }
 
     NUdf::TUnboxedValuePod DoCalculate(TComputationContext& ctx) const {
-        for (const auto dict = this->Dict->GetValue(ctx);;) {
+        for (;;) {
             auto item = this->Stream->GetValue(ctx);
             if (item.IsSpecial()) {
                 return item.Release();
             }
 
-            const auto keys = this->MakeKeysTuple(ctx, item);
+            auto keys = this->MakeKeysTuple(ctx, item);
 
             switch (RightKind) {
                 case ERightKind::Once:
                     if (keys) {
-                        if (const auto lookup = dict.Lookup(keys)) {
+                        if (const auto lookup = this->LookupKey(ctx, std::move(keys))) {
                             NUdf::TUnboxedValue* items = nullptr;
                             const auto result = this->ResStruct.NewArray(ctx, this->OutputRepresentations.size(), items);
                             this->FillLeftStruct(item, items);
@@ -998,13 +1007,13 @@ public:
 
                 case ERightKind::None:
                     if constexpr (RightRequired) {
-                        if (keys && dict.Contains(keys)) {
+                        if (keys && this->LookupKey(ctx, std::move(keys)).HasValue()) {
                             break;
                         } else {
                             continue;
                         }
                     } else {
-                        if (keys && dict.Contains(keys)) {
+                        if (keys && this->LookupKey(ctx, std::move(keys)).HasValue()) {
                             continue;
                         } else {
                             break;
@@ -1034,15 +1043,14 @@ public:
                 }
             }
 
-            const auto& dict = this->Dict->GetValue(ctx);
             for (auto current = std::move(curr);;) {
                 current = this->Stream->GetValue(ctx);
                 if (current.IsSpecial()) {
                     return current.Release();
                 }
 
-                if (const auto keys = this->MakeKeysTuple(ctx, current)) {
-                    if (const auto lookup = dict.Lookup(keys)) {
+                if (auto keys = this->MakeKeysTuple(ctx, current)) {
+                    if (const auto lookup = this->LookupKey(ctx, std::move(keys))) {
                         iterator = lookup.GetListIterator();
                         curr = std::move(current);
                         break;
@@ -1058,7 +1066,7 @@ public:
             }
         }
     }
-#ifndef MKQL_DISABLE_CODEGEN
+#if 0 // TODO(T5 stage 2): Re-enable LLVM codegen for lambda-based MapJoinCore
     Value* DoGenerateGetValue(const TCodegenContext& ctx, BasicBlock*& block) const {
         auto& context = ctx.Codegen.GetContext();
 
@@ -1182,6 +1190,7 @@ public:
     }
 
     Value* DoGenerateGetValue(const TCodegenContext& ctx, Value* currentPtr, Value* iteraratorPtr, BasicBlock*& block) const {
+        Y_ABORT("MapJoinCore codegen not yet updated for lambda right side");
         auto& context = ctx.Codegen.GetContext();
 
         const auto valueType = Type::getInt128Ty(context);
@@ -1325,9 +1334,28 @@ public:
 private:
     void RegisterDependencies() const final {
         if (const auto flow = this->FlowDependsOn(this->Stream)) {
-            this->DependsOn(flow, this->Dict);
+            this->DependsOn(flow, this->LookupBody);
         }
     }
+
+    // Empty stubs: LLVM codegen disabled for lambda-based MapJoinCore (T5 stage 2)
+    void GenerateFunctions(NYql::NCodegen::ICodegen& /*codegen*/) {
+    }
+
+    void FinalizeFunctions(NYql::NCodegen::ICodegen& /*codegen*/) {
+    }
+
+#ifndef MKQL_DISABLE_CODEGEN
+    // Stub for DoGenerateGetValue (non-Many case)
+    Value* DoGenerateGetValue(const TCodegenContext& /*ctx*/, BasicBlock*& /*block*/) const {
+        Y_UNREACHABLE();
+    }
+
+    // Stub for DoGenerateGetValue (Many case)
+    Value* DoGenerateGetValue(const TCodegenContext& /*ctx*/, Value* /*firstPtr*/, Value* /*secondPtr*/, BasicBlock*& /*block*/) const {
+        Y_UNREACHABLE();
+    }
+#endif
 };
 
 template <ERightKind RightKind, bool RightRequired, bool IsTuple>
@@ -1335,56 +1363,62 @@ class TMapJoinCoreWrapper: public TMapJoinCoreWrapperBase<IsTuple>, public TCust
 private:
     typedef TCustomValueCodegeneratorNode<TMapJoinCoreWrapper<RightKind, RightRequired, IsTuple>> TBaseComputation;
 
+    // NOTE: These codegen value classes are temporarily disabled for stage 1 (interpreter-only).
+    // They will be properly updated in stage 2 to use lambda invocation instead of Dict lookup.
     class TCodegenValue: public TComputationValue<TCodegenValue> {
     public:
         using TBase = TComputationValue<TCodegenValue>;
 
-        using TFetchPtr = NUdf::EFetchStatus (*)(TComputationContext*, NUdf::TUnboxedValuePod, NUdf::TUnboxedValuePod, NUdf::TUnboxedValuePod&);
+        using TFetchPtr = NUdf::EFetchStatus (*)(TComputationContext*, NUdf::TUnboxedValuePod, IComputationExternalNode*, IComputationNode*, NUdf::TUnboxedValuePod&);
 
-        TCodegenValue(TMemoryUsageInfo* memInfo, TFetchPtr fetch, TComputationContext* ctx, NUdf::TUnboxedValue&& stream, NUdf::TUnboxedValue&& dict)
+        TCodegenValue(TMemoryUsageInfo* memInfo, TFetchPtr fetch, TComputationContext* ctx, NUdf::TUnboxedValue&& stream, IComputationExternalNode* keyArg, IComputationNode* lookupBody)
             : TBase(memInfo)
             , FetchFunc(fetch)
             , Ctx(ctx)
             , Stream(std::move(stream))
-            , Dict(std::move(dict))
+            , KeyArg(keyArg)
+            , LookupBody(lookupBody)
         {
         }
 
     private:
         NUdf::EFetchStatus Fetch(NUdf::TUnboxedValue& result) final {
-            return FetchFunc(Ctx, static_cast<const NUdf::TUnboxedValuePod&>(Stream), static_cast<const NUdf::TUnboxedValuePod&>(Dict), result);
+            return FetchFunc(Ctx, static_cast<const NUdf::TUnboxedValuePod&>(Stream), KeyArg, LookupBody, result);
         }
 
         const TFetchPtr FetchFunc;
         TComputationContext* const Ctx;
         const NUdf::TUnboxedValue Stream;
-        const NUdf::TUnboxedValue Dict;
+        IComputationExternalNode* const KeyArg;
+        IComputationNode* const LookupBody;
     };
 
     class TCodegenStatefulValue: public TComputationValue<TCodegenStatefulValue> {
     public:
         using TBase = TComputationValue<TCodegenStatefulValue>;
 
-        using TFetchPtr = NUdf::EFetchStatus (*)(TComputationContext*, NUdf::TUnboxedValuePod, NUdf::TUnboxedValuePod, NUdf::TUnboxedValuePod&, NUdf::TUnboxedValuePod&, NUdf::TUnboxedValuePod&);
+        using TFetchPtr = NUdf::EFetchStatus (*)(TComputationContext*, NUdf::TUnboxedValuePod, IComputationExternalNode*, IComputationNode*, NUdf::TUnboxedValuePod&, NUdf::TUnboxedValuePod&, NUdf::TUnboxedValuePod&);
 
-        TCodegenStatefulValue(TMemoryUsageInfo* memInfo, TFetchPtr fetch, TComputationContext* ctx, NUdf::TUnboxedValue&& stream, NUdf::TUnboxedValue&& dict)
+        TCodegenStatefulValue(TMemoryUsageInfo* memInfo, TFetchPtr fetch, TComputationContext* ctx, NUdf::TUnboxedValue&& stream, IComputationExternalNode* keyArg, IComputationNode* lookupBody)
             : TBase(memInfo)
             , FetchFunc(fetch)
             , Ctx(ctx)
             , Stream(std::move(stream))
-            , Dict(std::move(dict))
+            , KeyArg(keyArg)
+            , LookupBody(lookupBody)
         {
         }
 
     private:
         NUdf::EFetchStatus Fetch(NUdf::TUnboxedValue& result) final {
-            return FetchFunc(Ctx, static_cast<const NUdf::TUnboxedValuePod&>(Stream), static_cast<const NUdf::TUnboxedValuePod&>(Dict), Current, Iterator, result);
+            return FetchFunc(Ctx, static_cast<const NUdf::TUnboxedValuePod&>(Stream), KeyArg, LookupBody, Current, Iterator, result);
         }
 
         const TFetchPtr FetchFunc;
         TComputationContext* const Ctx;
         const NUdf::TUnboxedValue Stream;
-        const NUdf::TUnboxedValue Dict;
+        IComputationExternalNode* const KeyArg;
+        IComputationNode* const LookupBody;
 
         NUdf::TUnboxedValue Current;
         NUdf::TUnboxedValue Iterator;
@@ -1398,10 +1432,11 @@ private:
         using TBase = TComputationValue<TValue>;
 
         TValue(TMemoryUsageInfo* memInfo, NUdf::TUnboxedValue&& stream,
-               NUdf::TUnboxedValue&& dict, TComputationContext& ctx, const TSelf* self)
+               IComputationExternalNode* keyArg, IComputationNode* lookupBody, TComputationContext& ctx, const TSelf* self)
             : TBase(memInfo)
             , Stream(std::move(stream))
-            , Dict(std::move(dict))
+            , KeyArg(keyArg)
+            , LookupBody(lookupBody)
             , Ctx(ctx)
             , Self(self)
         {
@@ -1414,12 +1449,13 @@ private:
                     return status;
                 }
 
-                const auto keys = Self->MakeKeysTuple(Ctx, current);
+                auto keys = Self->MakeKeysTuple(Ctx, current);
 
                 switch (RightKind) {
                     case ERightKind::Once:
                         if (keys) {
-                            if (const auto lookup = Dict.Lookup(keys)) {
+                            KeyArg->SetValue(Ctx, std::move(keys));
+                            if (const auto lookup = LookupBody->GetValue(Ctx)) {
                                 NUdf::TUnboxedValue* items = nullptr;
                                 result = Self->ResStruct.NewArray(Ctx, Self->OutputRepresentations.size(), items);
                                 Self->FillLeftStruct(current, items);
@@ -1436,14 +1472,24 @@ private:
 
                     case ERightKind::None:
                         if constexpr (RightRequired) {
-                            if (keys && Dict.Contains(keys)) {
-                                break;
+                            if (keys) {
+                                KeyArg->SetValue(Ctx, std::move(keys));
+                                if (LookupBody->GetValue(Ctx).HasValue()) {
+                                    break;
+                                } else {
+                                    continue;
+                                }
                             } else {
                                 continue;
                             }
                         } else {
-                            if (keys && Dict.Contains(keys)) {
-                                continue;
+                            if (keys) {
+                                KeyArg->SetValue(Ctx, std::move(keys));
+                                if (LookupBody->GetValue(Ctx).HasValue()) {
+                                    continue;
+                                } else {
+                                    break;
+                                }
                             } else {
                                 break;
                             }
@@ -1461,7 +1507,8 @@ private:
 
     private:
         NUdf::TUnboxedValue Stream;
-        NUdf::TUnboxedValue Dict;
+        IComputationExternalNode* const KeyArg;
+        IComputationNode* const LookupBody;
         TComputationContext& Ctx;
         const TSelf* const Self;
     };
@@ -1471,10 +1518,11 @@ private:
         using TBase = TComputationValue<TMultiRowValue>;
 
         TMultiRowValue(TMemoryUsageInfo* memInfo, NUdf::TUnboxedValue&& stream,
-                       NUdf::TUnboxedValue&& dict, TComputationContext& ctx, const TSelf* self)
+                       IComputationExternalNode* keyArg, IComputationNode* lookupBody, TComputationContext& ctx, const TSelf* self)
             : TBase(memInfo)
             , Stream(std::move(stream))
-            , Dict(std::move(dict))
+            , KeyArg(keyArg)
+            , LookupBody(lookupBody)
             , Ctx(ctx)
             , Self(self)
         {
@@ -1499,8 +1547,9 @@ private:
                         return status;
                     }
 
-                    if (const auto keys = Self->MakeKeysTuple(Ctx, current)) {
-                        if (const auto lookup = Dict.Lookup(keys)) {
+                    if (auto keys = Self->MakeKeysTuple(Ctx, current)) {
+                        KeyArg->SetValue(Ctx, std::move(keys));
+                        if (const auto lookup = LookupBody->GetValue(Ctx)) {
                             iterator = lookup.GetListIterator();
                             Current = std::move(current);
                             break;
@@ -1519,7 +1568,8 @@ private:
 
     private:
         NUdf::TUnboxedValue Stream;
-        NUdf::TUnboxedValue Dict;
+        IComputationExternalNode* const KeyArg;
+        IComputationNode* const LookupBody;
         TComputationContext& Ctx;
         const TSelf* const Self;
 
@@ -1531,42 +1581,33 @@ private:
 
 public:
     TMapJoinCoreWrapper(TComputationMutables& mutables, std::vector<TFunctionDescriptor>&& leftKeyConverters,
-                        TDictType* dictType, std::vector<EValueRepresentation>&& outputRepresentations, std::vector<ui32>&& leftKeyColumns,
+                        TType* keyType, std::vector<EValueRepresentation>&& outputRepresentations, std::vector<ui32>&& leftKeyColumns,
                         std::vector<ui32>&& leftRenames, std::vector<ui32>&& rightRenames,
-                        IComputationNode* stream, IComputationNode* dict)
-        : TMapJoinCoreWrapperBase<IsTuple>(mutables, std::move(leftKeyConverters), dictType, std::move(outputRepresentations),
-                                           std::move(leftKeyColumns), std::move(leftRenames), std::move(rightRenames), stream, dict)
+                        IComputationNode* stream, IComputationExternalNode* keyArg, IComputationNode* lookupBody)
+        : TMapJoinCoreWrapperBase<IsTuple>(mutables, std::move(leftKeyConverters), keyType, std::move(outputRepresentations),
+                                           std::move(leftKeyColumns), std::move(leftRenames), std::move(rightRenames), stream, keyArg, lookupBody)
         , TBaseComputation(mutables)
     {
     }
 
     NUdf::TUnboxedValuePod DoCalculate(TComputationContext& ctx) const {
-#ifndef MKQL_DISABLE_CODEGEN
-        if (ctx.ExecuteLLVM && MapJoin) {
-            return ctx.HolderFactory.Create<TMyCodegenValue>(MapJoin, &ctx, this->Stream->GetValue(ctx), this->Dict->GetValue(ctx));
-        }
-#endif
-        return ctx.HolderFactory.Create<std::conditional_t<ERightKind::Many == RightKind, TMultiRowValue, TValue>>(this->Stream->GetValue(ctx), this->Dict->GetValue(ctx), ctx, this);
+        return ctx.HolderFactory.Create<std::conditional_t<ERightKind::Many == RightKind, TMultiRowValue, TValue>>(this->Stream->GetValue(ctx), this->KeyArg, this->LookupBody, ctx, this);
     }
 
 private:
     void RegisterDependencies() const final {
         this->DependsOn(this->Stream);
-        this->DependsOn(this->Dict);
+        this->DependsOn(this->LookupBody);
     }
 
-#ifndef MKQL_DISABLE_CODEGEN
-    void GenerateFunctions(NYql::NCodegen::ICodegen& codegen) final {
-        MapJoinFunc = RightKind == ERightKind::Many ? GenerateStatefulMapper(codegen) : GenerateMapper(codegen);
-        codegen.ExportSymbol(MapJoinFunc);
+    // Empty stubs: LLVM codegen disabled for lambda-based MapJoinCore (T5 stage 2)
+    void GenerateFunctions(NYql::NCodegen::ICodegen& /*codegen*/) {
     }
 
-    void FinalizeFunctions(NYql::NCodegen::ICodegen& codegen) final {
-        if (MapJoinFunc) {
-            MapJoin = reinterpret_cast<TMapJoinPtr>(codegen.GetPointerToFunction(MapJoinFunc));
-        }
+    void FinalizeFunctions(NYql::NCodegen::ICodegen& /*codegen*/) {
     }
 
+#if 0  // TODO(T5 stage 2): Re-enable LLVM codegen for lambda-based MapJoinCore
     Function* GenerateMapper(NYql::NCodegen::ICodegen& codegen) const {
         auto& module = codegen.GetModule();
         auto& context = codegen.GetContext();
@@ -1888,30 +1929,30 @@ private:
     Function* MapJoinFunc = nullptr;
 
     TMapJoinPtr MapJoin = nullptr;
-#endif
+#endif // LLVM codegen disabled
 };
 
 } // namespace
 
 IComputationNode* WrapMapJoinCore(TCallable& callable, const TComputationNodeFactoryContext& ctx) {
-    MKQL_ENSURE(callable.GetInputsCount() == 6, "Expected 6 args");
+    MKQL_ENSURE(callable.GetInputsCount() == 7, "Expected 7 args (flow, lambda, lambdaBody, joinKind, leftKeyColumns, leftRenames, rightRenames)");
 
     const auto type = callable.GetType()->GetReturnType();
     const auto leftStreamNode = callable.GetInput(0);
     const auto leftItemType = leftStreamNode.GetStaticType()->IsFlow() ? AS_TYPE(TFlowType, leftStreamNode)->GetItemType() : AS_TYPE(TStreamType, leftStreamNode)->GetItemType();
-    const auto dictNode = callable.GetInput(1);
-    const auto dictType = AS_TYPE(TDictType, dictNode);
-    const auto dictKeyType = dictType->GetKeyType();
-    const auto joinKindNode = callable.GetInput(2);
+    const auto lambdaBodyNode = callable.GetInput(2);
+    const auto lambdaReturnType = lambdaBodyNode.GetStaticType();
+    const auto joinKindNode = callable.GetInput(3);
     const auto rawKind = AS_VALUE(TDataLiteral, joinKindNode)->AsValue().Get<ui32>();
     const auto kind = GetJoinKind(rawKind);
-    const bool isMany = dictType->GetPayloadType()->IsList();
-    const bool boolWithoutRight = EJoinKind::LeftOnly == kind || EJoinKind::LeftSemi == kind;
+    const bool isMany = lambdaReturnType->IsList();
+    Y_UNUSED(EJoinKind::LeftOnly);
+    Y_UNUSED(EJoinKind::LeftSemi);
     const auto returnItemType = type->IsFlow() ? AS_TYPE(TFlowType, callable.GetType()->GetReturnType())->GetItemType() : AS_TYPE(TStreamType, callable.GetType()->GetReturnType())->GetItemType();
-    const auto leftKeyColumnsNode = AS_VALUE(TTupleLiteral, callable.GetInput(3));
+    const auto leftKeyColumnsNode = AS_VALUE(TTupleLiteral, callable.GetInput(4));
     const bool isTupleKey = leftKeyColumnsNode->GetValuesCount() > 1;
-    const auto leftRenamesNode = AS_VALUE(TTupleLiteral, callable.GetInput(4));
-    const auto rightRenamesNode = AS_VALUE(TTupleLiteral, callable.GetInput(5));
+    const auto leftRenamesNode = AS_VALUE(TTupleLiteral, callable.GetInput(5));
+    const auto rightRenamesNode = AS_VALUE(TTupleLiteral, callable.GetInput(6));
 
     std::vector<ui32> leftKeyColumns, leftRenames, rightRenames;
 
@@ -1930,25 +1971,22 @@ IComputationNode* WrapMapJoinCore(TCallable& callable, const TComputationNodeFac
         rightRenames.emplace_back(AS_VALUE(TDataLiteral, rightRenamesNode->GetValue(i))->AsValue().Get<ui32>());
     }
 
+    // Key type is derived from the left item type (the lambda key matches the left key).
+    TType* keyType = nullptr;
+    if (isTupleKey) {
+        std::vector<TType*> keyTypes;
+        keyTypes.reserve(leftKeyColumns.size());
+        for (const auto idx : leftKeyColumns) {
+            keyTypes.push_back(leftItemType->IsTuple() ? AS_TYPE(TTupleType, leftItemType)->GetElementType(idx) : (leftItemType->IsMulti() ? AS_TYPE(TMultiType, leftItemType)->GetElementType(idx) : AS_TYPE(TStructType, leftItemType)->GetMemberType(idx)));
+        }
+        keyType = TTupleType::Create(keyTypes.size(), keyTypes.data(), ctx.Env);
+    } else {
+        keyType = leftItemType->IsTuple() ? AS_TYPE(TTupleType, leftItemType)->GetElementType(leftKeyColumns[0]) : (leftItemType->IsMulti() ? AS_TYPE(TMultiType, leftItemType)->GetElementType(leftKeyColumns[0]) : AS_TYPE(TStructType, leftItemType)->GetMemberType(leftKeyColumns[0]));
+    }
+
     std::vector<TFunctionDescriptor> leftKeyConverters;
     leftKeyConverters.resize(leftKeyColumns.size());
-    for (ui32 i = 0; i < leftKeyColumns.size(); ++i) {
-        const auto leftColumnType = leftItemType->IsTuple() ? AS_TYPE(TTupleType, leftItemType)->GetElementType(leftKeyColumns[i]) : (leftItemType->IsMulti() ? AS_TYPE(TMultiType, leftItemType)->GetElementType(leftKeyColumns[i]) : AS_TYPE(TStructType, leftItemType)->GetMemberType(leftKeyColumns[i]));
-        const auto rightType = isTupleKey ? AS_TYPE(TTupleType, dictKeyType)->GetElementType(i) : dictKeyType;
-        bool isOptional;
-        if (UnpackOptional(leftColumnType, isOptional)->IsSameType(*rightType)) {
-            continue;
-        }
-        bool isLeftOptional;
-        const auto leftDataType = UnpackOptionalData(leftColumnType, isLeftOptional);
-        bool isRightOptional;
-        const auto rightDataType = UnpackOptionalData(rightType, isRightOptional);
-        if (leftDataType->GetSchemeType() != rightDataType->GetSchemeType()) {
-            // find a converter
-            const std::array<TArgType, 2U> argsTypes = {{{rightDataType->GetSchemeType(), isLeftOptional}, {leftDataType->GetSchemeType(), isLeftOptional}}};
-            leftKeyConverters[i] = ctx.FunctionRegistry.GetBuiltins()->GetBuiltin("Convert", argsTypes.data(), 2U);
-        }
-    }
+    // Key converters are no-ops because the lambda key type matches the left key type.
 
     std::vector<EValueRepresentation> outputRepresentations;
     if (returnItemType->IsTuple()) {
@@ -1972,32 +2010,23 @@ IComputationNode* WrapMapJoinCore(TCallable& callable, const TComputationNodeFac
     }
 
     const auto flow = LocateNode(ctx.NodeLocator, callable, 0);
-    const auto dict = LocateNode(ctx.NodeLocator, callable, 1);
+    const auto keyArg = LocateExternalNode(ctx.NodeLocator, callable, 1);
+    const auto lookupBody = LocateNode(ctx.NodeLocator, callable, 2);
 
-#define NEW_WRAPPER(KIND, RIGHT_REQ, IS_TUPLE)                                                                                                                             \
-    if (type->IsFlow()) {                                                                                                                                                  \
-        if (const auto wide = dynamic_cast<IComputationWideFlowNode*>(flow)) {                                                                                             \
-            const auto width = GetWideComponentsCount(AS_TYPE(TFlowType, callable.GetInput(0U).GetStaticType()));                                                          \
-            if (boolWithoutRight)                                                                                                                                          \
-                return new TWideMapJoinWrapper<true, RIGHT_REQ, IS_TUPLE>(ctx.Mutables,                                                                                    \
-                                                                          std::move(leftKeyConverters), dictType, std::move(outputRepresentations),                        \
-                                                                          std::move(leftKeyColumns), std::move(leftRenames), std::move(rightRenames), wide, dict, width);  \
-            else if (isMany)                                                                                                                                               \
-                return new TWideMultiMapJoinWrapper<RIGHT_REQ, IS_TUPLE>(ctx.Mutables,                                                                                     \
-                                                                         std::move(leftKeyConverters), dictType, std::move(outputRepresentations),                         \
-                                                                         std::move(leftKeyColumns), std::move(leftRenames), std::move(rightRenames), wide, dict, width);   \
-            else                                                                                                                                                           \
-                return new TWideMapJoinWrapper<false, RIGHT_REQ, IS_TUPLE>(ctx.Mutables,                                                                                   \
-                                                                           std::move(leftKeyConverters), dictType, std::move(outputRepresentations),                       \
-                                                                           std::move(leftKeyColumns), std::move(leftRenames), std::move(rightRenames), wide, dict, width); \
-        } else                                                                                                                                                             \
-            return new TMapJoinCoreFlowWrapper<KIND, RIGHT_REQ, IS_TUPLE>(ctx.Mutables, GetValueRepresentation(type),                                                      \
-                                                                          std::move(leftKeyConverters), dictType, std::move(outputRepresentations),                        \
-                                                                          std::move(leftKeyColumns), std::move(leftRenames), std::move(rightRenames), flow, dict);         \
-    } else {                                                                                                                                                               \
-        return new TMapJoinCoreWrapper<KIND, RIGHT_REQ, IS_TUPLE>(ctx.Mutables,                                                                                            \
-                                                                  std::move(leftKeyConverters), dictType, std::move(outputRepresentations),                                \
-                                                                  std::move(leftKeyColumns), std::move(leftRenames), std::move(rightRenames), flow, dict);                 \
+#define NEW_WRAPPER(KIND, RIGHT_REQ, IS_TUPLE)                                                                                                                                   \
+    if (type->IsFlow()) {                                                                                                                                                        \
+        if (const auto wide = dynamic_cast<IComputationWideFlowNode*>(flow)) {                                                                                                   \
+            Y_UNUSED(wide);                                                                                                                                                      \
+            /* Wide path not yet updated for lambda right side */                                                                                                                \
+            Y_ABORT("Wide MapJoin not yet supported with lambda right side");                                                                                                    \
+        } else                                                                                                                                                                   \
+            return new TMapJoinCoreFlowWrapper<KIND, RIGHT_REQ, IS_TUPLE>(ctx.Mutables, GetValueRepresentation(type),                                                            \
+                                                                          std::move(leftKeyConverters), keyType, std::move(outputRepresentations),                               \
+                                                                          std::move(leftKeyColumns), std::move(leftRenames), std::move(rightRenames), flow, keyArg, lookupBody); \
+    } else {                                                                                                                                                                     \
+        return new TMapJoinCoreWrapper<KIND, RIGHT_REQ, IS_TUPLE>(ctx.Mutables,                                                                                                  \
+                                                                  std::move(leftKeyConverters), keyType, std::move(outputRepresentations),                                       \
+                                                                  std::move(leftKeyColumns), std::move(leftRenames), std::move(rightRenames), flow, keyArg, lookupBody);         \
     }
 
 #define MAKE_WRAPPER(IS_TUPLE)                                  \

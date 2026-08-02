@@ -486,9 +486,9 @@ public:
 
     TRuntimeNode AsList(TRuntimeNode item);
     TRuntimeNode AsList(const TArrayRef<const TRuntimeNode>& items);
-    TRuntimeNode MapJoinCore(TRuntimeNode flow, TRuntimeNode dict, EJoinKind joinKind,
-                             const TArrayRef<const ui32>& leftKeyColumns, const TArrayRef<const ui32>& leftRenames,
-                             const TArrayRef<const ui32>& rightRenames, TType* returnType);
+    TRuntimeNode MapJoinCore(TRuntimeNode flow, TRuntimeNode lookupLambda, TRuntimeNode lookupLambdaBody, EJoinKind joinKind,
+                              const TArrayRef<const ui32>& leftKeyColumns, const TArrayRef<const ui32>& leftRenames,
+                              const TArrayRef<const ui32>& rightRenames, TType* returnType);
     TRuntimeNode CommonJoinCore(TRuntimeNode list, EJoinKind joinKind,
                                 const TArrayRef<const ui32>& leftColumns, const TArrayRef<const ui32>& rightColumns,
                                 const TArrayRef<const ui32>& requiredColumns, const TArrayRef<const ui32>& keyColumns,

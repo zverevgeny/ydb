@@ -1691,7 +1691,14 @@ TMkqlCommonCallableCompiler::TShared::TShared() {
         }
 
         const auto returnType = ctx.BuildType(node, *node.GetTypeAnn());
-        return ctx.ProgramBuilder.MapJoinCore(list, dict, joinKind, leftKeyColumns, leftRenames, rightRenames, returnType);
+        // Wrap dict in a lambda: (key) -> dict.Lookup(key)
+        // The new MapJoinCore expects (flow, lookupLambda, lookupLambdaBody, joinKind, ...).
+        // lookupLambda is the lambda parameter (key arg), lookupLambdaBody is dict.Lookup(key).
+        const auto dictType = node.Child(1U)->GetTypeAnn()->Cast<TDictExprType>();
+        const auto keyType = ctx.BuildType(node, *dictType->GetKeyType());
+        const auto lookupLambda = ctx.ProgramBuilder.Arg(keyType);
+        const auto lookupBody = ctx.ProgramBuilder.Lookup(dict, lookupLambda);
+        return ctx.ProgramBuilder.MapJoinCore(list, lookupLambda, lookupBody, joinKind, leftKeyColumns, leftRenames, rightRenames, returnType);
     });
 
     AddCallable("BlockStorage", [](const TExprNode& node, TMkqlBuildContext& ctx) {

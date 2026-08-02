@@ -5180,13 +5180,13 @@ TRuntimeNode TProgramBuilder::AsList(const TArrayRef<const TRuntimeNode>& items)
     return TRuntimeNode(builder.Build(), /*isImmediate=*/true);
 }
 
-TRuntimeNode TProgramBuilder::MapJoinCore(TRuntimeNode flow, TRuntimeNode dict, EJoinKind joinKind,
+TRuntimeNode TProgramBuilder::MapJoinCore(TRuntimeNode flow, TRuntimeNode lookupLambda, TRuntimeNode lookupLambdaBody, EJoinKind joinKind,
                                           const TArrayRef<const ui32>& leftKeyColumns, const TArrayRef<const ui32>& leftRenames,
                                           const TArrayRef<const ui32>& rightRenames, TType* returnType) {
     MKQL_ENSURE(joinKind == EJoinKind::Inner ||
-                    joinKind == EJoinKind::Left ||
-                    joinKind == EJoinKind::LeftSemi ||
-                    joinKind == EJoinKind::LeftOnly, "Unsupported join kind");
+                     joinKind == EJoinKind::Left ||
+                     joinKind == EJoinKind::LeftSemi ||
+                     joinKind == EJoinKind::LeftOnly, "Unsupported join kind");
     MKQL_ENSURE(!leftKeyColumns.empty(), "At least one key column must be specified");
     MKQL_ENSURE(leftRenames.size() % 2U == 0U, "Expected even count");
     MKQL_ENSURE(rightRenames.size() % 2U == 0U, "Expected even count");
@@ -5207,9 +5207,11 @@ TRuntimeNode TProgramBuilder::MapJoinCore(TRuntimeNode flow, TRuntimeNode dict, 
     std::transform(rightRenames.cbegin(), rightRenames.cend(), std::back_inserter(rightRenamesNodes),
                    [this](const ui32 idx) { return NewDataLiteral(idx); });
 
+    // New signature: MapJoinCore(flow, lambda, lambdaBody, joinKind, leftKeyColumns, leftRenames, rightRenames)
     TCallableBuilder callableBuilder(Env_, __func__, returnType);
     callableBuilder.Add(flow);
-    callableBuilder.Add(dict);
+    callableBuilder.Add(lookupLambda);
+    callableBuilder.Add(lookupLambdaBody);
     callableBuilder.Add(NewDataLiteral((ui32)joinKind));
     callableBuilder.Add(NewTuple(leftKeyColumnsNodes));
     callableBuilder.Add(NewTuple(leftRenamesNodes));
