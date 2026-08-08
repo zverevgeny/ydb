@@ -1817,6 +1817,13 @@ FROM `{table_name}`"""
         kikimr.first_node.stop()
         kikimr.first_node.set_log_file_prefix("logfile_restarted_")
         kikimr.first_node.start()
+        # Wait for the restarted node to become ready to accept gRPC connections
+        temp_client = YdbClient.from_driver_config(
+            database=kikimr.endpoint.database,
+            endpoint=f"grpc://{kikimr.first_node.host}:{kikimr.first_node.port}",
+            enable_discovery=False,
+        )
+        temp_client.stop()
         logger.info("Node with query restarted")
 
         second_node = list(kikimr.cluster.nodes.values())[1]
