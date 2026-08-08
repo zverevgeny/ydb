@@ -1,0 +1,12 @@
+services:
+  yt:
+    build: .
+    container_name: tests-yt-integration-yt
+    ports:
+      - "80"
+      - "8443"
+    tmpfs:
+      - /run
+      - /tmp
+      - /var
+
