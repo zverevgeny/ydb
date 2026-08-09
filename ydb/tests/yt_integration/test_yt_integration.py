@@ -66,9 +66,9 @@ class TestYtIntegration:
         table_path = "//tmp/test_yt_table"
 
         try:
-            # Cleanup and create table
+            # Cleanup and create table with explicit schema
             yt_client.remove(table_path)
-            yt_client.create_table(table_path)
+            yt_client.create_table(table_path, columns={"key": "string"})
 
             # Write data
             rows = [{"key": f"msg_{i}"} for i in range(MESSAGE_COUNT)]
@@ -82,4 +82,4 @@ class TestYtIntegration:
             try:
                 yt_client.remove(table_path)
             except Exception:
-                logger.exception("Failed to cleanup table %s", table_path)
+                logger.warning("Failed to cleanup table %s", table_path, exc_info=True)

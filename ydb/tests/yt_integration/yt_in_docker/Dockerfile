@@ -1,3 +1,6 @@
+# YT Saurus local dev image.
+# Tag: ytsaurus/local:dev
+# Pin by digest for reproducible builds.
 FROM ytsaurus/local:dev@sha256:1fc1aaefcae7a409d7a5c738f86b337ab268c736f2f4598c5e2bb3851ddc62ef
 
 WORKDIR /
