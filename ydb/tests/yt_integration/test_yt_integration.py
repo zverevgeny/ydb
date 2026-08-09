@@ -7,7 +7,7 @@ import logging
 
 import pytest
 
-from yt_in_docker.yt_client import YtClient
+from yt_in_docker import YtClient
 
 
 logger = logging.getLogger(__name__)
@@ -19,9 +19,7 @@ class TestYtIntegration:
     """Integration tests with local YT in Docker.
 
     Uses scope="class" to start the YT cluster once for all tests in this
-    class, avoiding the expensive startup cost per test. Tests are ordered
-    such that test_yt_connectivity runs first (simple health check) and
-    test_write_and_read_table runs second (full read/write cycle).
+    class, avoiding the expensive startup cost per test.
     """
 
     @pytest.fixture(scope="class")

@@ -1,11 +1,13 @@
 """YT client for integration tests.
 
 Provides a simple interface to interact with YT cluster running in Docker.
-Manages the full lifecycle of the docker-compose service (start/stop).
+When running under the yatest docker_compose recipe, the cluster is already
+started by the recipe and the client just connects to it.
 """
 
 import json
 import logging
+import os
 import subprocess
 import time
 import uuid
@@ -24,9 +26,10 @@ _DOCKER_COMPOSE_FILE_PATH = "ydb/tests/yt_integration/yt_in_docker/docker-compos
 class YtClient:
     """Client for interacting with YT cluster.
 
-    On construction the client starts the YT cluster via docker-compose,
-    waits for it to become healthy, and caches the proxy endpoint.
-    On destruction the cluster is automatically stopped and removed.
+    When running under the yatest docker_compose recipe (DOCKER_COMPOSE_FILE
+    env var is set), the cluster is already started and the client just
+    connects to it. Otherwise, the client starts the cluster on construction
+    and stops it on destruction.
 
     Example:
         client = YtClient()
@@ -39,14 +42,20 @@ class YtClient:
         self._compose_project_name: Optional[str] = None
         self._container_name: Optional[str] = None
         self._proxy_url: Optional[str] = None
+        self._managed_by_recipe: bool = "DOCKER_COMPOSE_FILE" in os.environ
 
-        # Start docker-compose
-        self._start_cluster()
+        if self._managed_by_recipe:
+            # Cluster is managed by the docker_compose recipe — just connect
+            self._compose_project_name = self._get_recipe_project_name()
+        else:
+            # Standalone mode — start the cluster ourselves
+            self._start_cluster()
+
         try:
+            self._container_name = self._discover_container_name()
             self._proxy_url = self._resolve_proxy_url()
             self._wait_for_healthy(max_attempts, sleep_interval)
         except Exception:
-            # On any failure, stop the cluster
             self.stop()
             raise
 
@@ -62,6 +71,15 @@ class YtClient:
 
     def _get_compose_file_abs_path(self) -> str:
         return yatest.common.source_path(_DOCKER_COMPOSE_FILE_PATH)
+
+    def _get_recipe_project_name(self) -> str:
+        """Derive the compose project name used by the docker_compose recipe.
+
+        The recipe runs docker compose from the source root with -f pointing
+        to the compose file, so the project name is the directory basename.
+        """
+        compose_file = self._get_compose_file_abs_path()
+        return os.path.basename(os.path.dirname(compose_file))
 
     def _start_cluster(self) -> None:
         # Check docker availability first
@@ -83,17 +101,13 @@ class YtClient:
             "docker", "compose",
             "-f", compose_file,
             "-p", self._compose_project_name,
-            "up", "-d",
+            "up", "-d", "--build",
         ]
         logger.info("Starting YT cluster with project %s (timeout: 300s)", self._compose_project_name)
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=300, check=False)
         if result.returncode != 0:
             logger.error("YT cluster startup stderr: %s", result.stderr[:1000])
             raise RuntimeError(f"Failed to start YT cluster: {result.stderr}")
-
-        # Discover the actual container name
-        self._container_name = self._discover_container_name()
-        logger.info("YT cluster started in container %s", self._container_name)
 
     def _discover_container_name(self) -> str:
         """Discover the running container name for this project."""
@@ -114,6 +128,9 @@ class YtClient:
 
     def _stop_cluster(self) -> None:
         if self._compose_project_name is None:
+            return
+        if self._managed_by_recipe:
+            # Don't stop — the recipe handles teardown
             return
         try:
             compose_file = self._get_compose_file_abs_path()
@@ -150,25 +167,7 @@ class YtClient:
         if not output:
             raise RuntimeError("docker compose port returned empty output")
 
-        if output.startswith("["):
-            # IPv6 format: [host]:port
-            bracket_end = output.rfind("]")
-            if bracket_end < 0 or bracket_end + 1 >= len(output) or output[bracket_end + 1] != ":":
-                raise RuntimeError(f"Unexpected IPv6 port output format: {output!r}")
-            host = output[:bracket_end + 1]  # Includes brackets, e.g. [::1]
-            port_str = output[bracket_end + 2:]
-        else:
-            # IPv4 format: host:port
-            if ":" not in output:
-                raise RuntimeError(f"Unexpected port output format: {output!r}")
-            host, port_str = output.rsplit(":", 1)
-
-        try:
-            port = int(port_str)
-        except ValueError:
-            raise RuntimeError(f"Invalid port number in output: {output!r}") from None
-
-        # Always use localhost to avoid IPv4/IPv6 binding issues.
+        port = int(output.rsplit(":", 1)[1])
         return f"http://localhost:{port}"
 
     def _wait_for_healthy(self, max_attempts: int, sleep_interval: float) -> None:
@@ -223,8 +222,6 @@ class YtClient:
                     continue
                 raise last_error
 
-        raise last_error
-
     def _run_yt_cli(
         self,
         args: List[str],
@@ -251,26 +248,35 @@ class YtClient:
                 continue
             raise last_error
 
-        raise last_error
-
     def list(self, path: str) -> Dict[str, Any]:
         return self._api_call("list", {"path": path})
 
     def create_table(self, path: str, columns: Dict[str, str]) -> None:
         """Create a table at the given path with provided schema."""
-        params = {"path": path, "type": "table"}
-        for idx, (name, col_type) in enumerate(columns.items()):
-            params[f"columns.{idx}.name"] = name
-            params[f"columns.{idx}.type"] = col_type
-        self._api_call("create", params=params, http_method="POST")
+        attributes = {
+            "columns": [
+                {"name": name, "type": col_type}
+                for name, col_type in columns.items()
+            ]
+        }
+        self._api_call(
+            "create",
+            params={"path": path, "type": "table"},
+            data=json.dumps({"attributes": attributes}),
+            http_method="POST",
+        )
 
     def exists(self, path: str) -> bool:
+        """Check if a node exists at the given path."""
         try:
-            self._api_call("get", params={"path": path})
+            self.list(path)
             return True
         except RuntimeError as e:
-            error_str = str(e).lower()
-            if "not found" in error_str or "has no child" in error_str:
+            error_str = str(e)
+            # YT API returns errors for missing nodes with various messages
+            if ("NOT_FOUND" in error_str
+                    or "NODE_NOT_FOUND" in error_str
+                    or "has no child" in error_str):
                 return False
             raise
 
