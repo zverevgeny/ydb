@@ -11,6 +11,7 @@ import time
 import uuid
 import urllib.error
 import urllib.request
+from typing import Any, Dict, List, Optional
 from urllib.parse import urlencode
 import yatest.common
 
@@ -34,11 +35,10 @@ class YtClient:
         rows = client.read_table("//tmp/my_table")
     """
 
-    def __init__(self, max_attempts=90, sleep_interval=2):
-        self._compose_dir = None
-        self._compose_project_name = None
-        self._container_name = None
-        self._proxy_url = None
+    def __init__(self, max_attempts: int = 90, sleep_interval: float = 2.0) -> None:
+        self._compose_project_name: Optional[str] = None
+        self._container_name: Optional[str] = None
+        self._proxy_url: Optional[str] = None
 
         # Start docker-compose
         self._start_cluster()
@@ -50,14 +50,14 @@ class YtClient:
             self.stop()
             raise
 
-    def __enter__(self):
+    def __enter__(self) -> "YtClient":
         return self
 
-    def __exit__(self, exc_type, exc_val, exc_tb):
+    def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> bool:
         self.stop()
         return False
 
-    def stop(self):
+    def stop(self) -> None:
         """Stop and remove YT cluster.
 
         Public method for safe external cleanup. Idempotent: safe to call
@@ -65,11 +65,11 @@ class YtClient:
         """
         self._stop_cluster()
 
-    def _get_compose_file_abs_path(self):
+    def _get_compose_file_abs_path(self) -> str:
         """Return absolute path to docker-compose.yml."""
         return yatest.common.source_path(_DOCKER_COMPOSE_FILE_PATH)
 
-    def _start_cluster(self):
+    def _start_cluster(self) -> None:
         """Start YT cluster via docker-compose in a temporary directory.
 
         Uses a unique project name per test run to avoid conflicts
@@ -96,14 +96,16 @@ class YtClient:
             "-p", self._compose_project_name,
             "up", "-d",
         ]
+        logger.info("Starting YT cluster with project %s", self._compose_project_name)
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=300, check=False)
         if result.returncode != 0:
             raise RuntimeError(f"Failed to start YT cluster: {result.stderr}")
 
         # Discover the actual container name
         self._container_name = self._discover_container_name()
+        logger.info("YT cluster started in container %s", self._container_name)
 
-    def _discover_container_name(self):
+    def _discover_container_name(self) -> str:
         """Discover the running container name for this project."""
         compose_file = self._get_compose_file_abs_path()
         cmd = [
@@ -120,7 +122,7 @@ class YtClient:
             raise RuntimeError("No running containers found for YT cluster")
         return containers[0]
 
-    def _stop_cluster(self):
+    def _stop_cluster(self) -> None:
         """Stop and remove YT cluster.
 
         Internal implementation — use `stop()` for external calls.
@@ -135,6 +137,7 @@ class YtClient:
                 "-p", self._compose_project_name,
                 "down", "-v",
             ]
+            logger.info("Stopping YT cluster %s", self._compose_project_name)
             subprocess.run(
                 cmd, capture_output=True, text=True, timeout=120, check=False,
             )
@@ -145,7 +148,7 @@ class YtClient:
             self._container_name = None
             self._proxy_url = None
 
-    def _resolve_proxy_url(self):
+    def _resolve_proxy_url(self) -> str:
         """Resolve the YT proxy URL from docker-compose and return it."""
         compose_file = self._get_compose_file_abs_path()
         cmd = [
@@ -174,7 +177,7 @@ class YtClient:
 
         return f"http://localhost:{port}"
 
-    def _wait_for_healthy(self, max_attempts, sleep_interval):
+    def _wait_for_healthy(self, max_attempts: int, sleep_interval: float) -> None:
         """Wait for YT cluster to become healthy.
 
         Args:
@@ -184,10 +187,12 @@ class YtClient:
         Raises:
             RuntimeError: If YT doesn't become healthy in time
         """
+        logger.info("Waiting for YT cluster to become healthy (%d attempts)", max_attempts)
         for attempt in range(max_attempts):
             try:
                 result = self.list("//tmp")
                 if "value" in result:
+                    logger.info("YT cluster is healthy after %d attempts", attempt + 1)
                     return
             except Exception as e:
                 logger.debug("YT health check attempt %d failed: %s", attempt, e)
@@ -195,7 +200,14 @@ class YtClient:
                 time.sleep(sleep_interval)
         raise RuntimeError("YT cluster did not become healthy in time")
 
-    def _api_call(self, method, params=None, data=None, timeout=60, max_retries=2):
+    def _api_call(
+        self,
+        method: str,
+        params: Optional[Dict[str, str]] = None,
+        data: Optional[str] = None,
+        timeout: int = 60,
+        max_retries: int = 2,
+    ) -> Dict[str, Any]:
         """Make a call to YT HTTP API v4.
 
         Args:
@@ -212,13 +224,11 @@ class YtClient:
         if params:
             url += f"?{urlencode(params)}"
 
-        last_error = None
+        last_error: Optional[BaseException] = None
         for attempt in range(max_retries + 1):
             req = urllib.request.Request(url)
             if data is not None:
-                if isinstance(data, str):
-                    data = data.encode()
-                req.data = data
+                req.data = data.encode()
                 req.add_header("Content-Type", "application/json")
 
             try:
@@ -241,7 +251,14 @@ class YtClient:
 
         raise last_error
 
-    def _run_yt_cli(self, args, check=True, timeout=60, input_data=None, max_retries=1):
+    def _run_yt_cli(
+        self,
+        args: List[str],
+        check: bool = True,
+        timeout: int = 60,
+        input_data: Optional[str] = None,
+        max_retries: int = 1,
+    ) -> subprocess.CompletedProcess[str]:
         """Run yt CLI command inside the Docker container via docker exec.
 
         Used for table operations (write-table/read-table) which are not
@@ -262,7 +279,7 @@ class YtClient:
         else:
             cmd = ["docker", "exec", self._container_name, "yt", "--proxy", "localhost:80"] + args
 
-        last_error = None
+        last_error: Optional[BaseException] = None
         for attempt in range(max_retries + 1):
             result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, check=False, input=input_data)
             if not check or result.returncode == 0:
@@ -275,7 +292,7 @@ class YtClient:
 
         raise last_error
 
-    def list(self, path):
+    def list(self, path: str) -> Dict[str, Any]:
         """List nodes at the given path.
 
         Args:
@@ -286,7 +303,7 @@ class YtClient:
         """
         return self._api_call("list", {"path": path})
 
-    def create_table(self, path):
+    def create_table(self, path: str) -> None:
         """Create a table at the given path via HTTP API.
 
         Args:
@@ -294,7 +311,7 @@ class YtClient:
         """
         self._api_call("create", params={"path": path, "type": "table"})
 
-    def remove(self, path):
+    def remove(self, path: str) -> None:
         """Remove a node at the given path.
 
         Idempotent: does not raise if the node does not exist.
@@ -305,12 +322,18 @@ class YtClient:
         try:
             self._api_call("remove", params={"path": path})
         except RuntimeError as e:
-            # Ignore "node not found" errors — remove is idempotent
+            # Ignore "node not found" errors — remove is idempotent.
+            # Check for specific YT error codes for missing nodes.
             error_str = str(e)
-            if "has no child with key" not in error_str and "not found" not in error_str.lower():
-                raise
+            if "has no child with key" in error_str:
+                return
+            # YT returns HTTP 404 with various "not found" messages.
+            # Only suppress if the error clearly refers to the target path.
+            if "not found" in error_str.lower() and path.split("/")[-1] in error_str:
+                return
+            raise
 
-    def write_table(self, path, rows):
+    def write_table(self, path: str, rows: List[Dict[str, Any]]) -> None:
         """Write rows to a table.
 
         Args:
@@ -326,7 +349,7 @@ class YtClient:
             input_data=data, check=True, timeout=60,
         )
 
-    def read_table(self, path):
+    def read_table(self, path: str) -> List[Dict[str, Any]]:
         """Read rows from a table.
 
         Args:
@@ -340,7 +363,7 @@ class YtClient:
             timeout=60,
         )
         lines = [line.strip() for line in result.stdout.strip().split("\n") if line.strip()]
-        rows = []
+        rows: List[Dict[str, Any]] = []
         for line in lines:
             try:
                 rows.append(json.loads(line))

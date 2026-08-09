@@ -1,6 +1,9 @@
 FROM ytsaurus/local:dev@sha256:1fc1aaefcae7a409d7a5c738f86b337ab268c736f2f4598c5e2bb3851ddc62ef
 
+WORKDIR /
+
 EXPOSE 80
+EXPOSE 8443
 
 ENTRYPOINT ["yt_local", "start", \
   "--proxy-port", "80", \

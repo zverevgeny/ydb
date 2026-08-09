@@ -1,8 +1,10 @@
 services:
   yt:
     build: .
+    restart: "no"
     ports:
       - "80"
+      - "8443"
     tmpfs:
       - /run
       - /tmp
