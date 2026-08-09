@@ -7,8 +7,4 @@ PY_SRCS(
     yt_client.py
 )
 
-PEERDIR(
-    contrib/python/pytest
-)
-
 END()

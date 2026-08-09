@@ -1,5 +1,3 @@
-# -*- coding: utf-8 -*-
-# flake8: noqa
 """YT client for integration tests.
 
 Provides a simple interface to interact with YT cluster running in Docker.
@@ -88,7 +86,7 @@ class YtClient:
             url += f"?{urlencode(params)}"
 
         req = urllib.request.Request(url)
-        if data:
+        if data is not None:
             if isinstance(data, str):
                 data = data.encode()
             req.data = data
@@ -149,7 +147,7 @@ class YtClient:
         Args:
             path: YT path to remove
         """
-        self._run_yt_cli(["remove", path, "--force"], check=False)
+        self._run_yt_cli(["remove", path, "--force"], check=True)
 
     def write_table(self, path, rows):
         """Write rows to a table.
@@ -177,5 +175,5 @@ class YtClient:
             ["read-table", "--format=json", path],
             timeout=60,
         )
-        lines = [l.strip() for l in result.stdout.strip().split("\n") if l.strip()]
+        lines = [line.strip() for line in result.stdout.strip().split("\n") if line.strip()]
         return [json.loads(line) for line in lines]

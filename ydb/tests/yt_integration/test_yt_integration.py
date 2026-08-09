@@ -1,5 +1,3 @@
-# -*- coding: utf-8 -*-
-# flake8: noqa
 """Integration test for QYT with local YT in Docker.
 
 The test runs on the host and connects to YT running inside Docker.
