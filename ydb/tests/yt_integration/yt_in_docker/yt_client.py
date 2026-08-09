@@ -1,16 +1,14 @@
 """YT client for integration tests.
 
 Provides a simple interface to interact with YT cluster running in Docker.
-When running under the yatest docker_compose recipe, the cluster is already
-started by the recipe and the client just connects to it.
+The cluster lifecycle is managed by the yatest docker_compose recipe — this
+client only connects to the already-running cluster.
 """
 
 import json
 import logging
-import os
 import subprocess
 import time
-import uuid
 import urllib.error
 import urllib.request
 from typing import Any, Dict, List, Optional
@@ -24,12 +22,10 @@ _DOCKER_COMPOSE_FILE_PATH = "ydb/tests/yt_integration/yt_in_docker/docker-compos
 
 
 class YtClient:
-    """Client for interacting with YT cluster.
+    """Client for interacting with YT cluster managed by docker_compose recipe.
 
-    When running under the yatest docker_compose recipe (DOCKER_COMPOSE_FILE
-    env var is set), the cluster is already started and the client just
-    connects to it. Otherwise, the client starts the cluster on construction
-    and stops it on destruction.
+    The cluster is started by the recipe before tests and stopped after.
+    This client discovers the running container and connects to it.
 
     Example:
         client = YtClient()
@@ -39,25 +35,10 @@ class YtClient:
     """
 
     def __init__(self, max_attempts: int = 90, sleep_interval: float = 2.0) -> None:
-        self._compose_project_name: Optional[str] = None
-        self._container_name: Optional[str] = None
-        self._proxy_url: Optional[str] = None
-        self._managed_by_recipe: bool = "DOCKER_COMPOSE_FILE" in os.environ
-
-        if self._managed_by_recipe:
-            # Cluster is managed by the docker_compose recipe — just connect
-            self._compose_project_name = self._get_recipe_project_name()
-        else:
-            # Standalone mode — start the cluster ourselves
-            self._start_cluster()
-
-        try:
-            self._container_name = self._discover_container_name()
-            self._proxy_url = self._resolve_proxy_url()
-            self._wait_for_healthy(max_attempts, sleep_interval)
-        except Exception:
-            self.stop()
-            raise
+        self._compose_project_name: str = self._get_recipe_project_name()
+        self._container_name: str = self._discover_container_name()
+        self._proxy_url: str = self._resolve_proxy_url()
+        self._wait_for_healthy(max_attempts, sleep_interval)
 
     def __enter__(self) -> "YtClient":
         return self
@@ -67,47 +48,21 @@ class YtClient:
         return False
 
     def stop(self) -> None:
-        self._stop_cluster()
+        # Cluster is managed by the recipe — nothing to stop here
+        pass
 
     def _get_compose_file_abs_path(self) -> str:
         return yatest.common.source_path(_DOCKER_COMPOSE_FILE_PATH)
 
-    def _get_recipe_project_name(self) -> str:
+    @staticmethod
+    def _get_recipe_project_name() -> str:
         """Derive the compose project name used by the docker_compose recipe.
 
         The recipe runs docker compose from the source root with -f pointing
         to the compose file, so the project name is the directory basename.
         """
-        compose_file = self._get_compose_file_abs_path()
-        return os.path.basename(os.path.dirname(compose_file))
-
-    def _start_cluster(self) -> None:
-        # Check docker availability first
-        try:
-            subprocess.run(
-                ["docker", "info"],
-                capture_output=True,
-                timeout=30,
-                check=True,
-            )
-        except (subprocess.CalledProcessError, FileNotFoundError) as e:
-            raise RuntimeError(f"Docker is not available: {e}") from e
-
-        # Create a unique project name to avoid conflicts
-        self._compose_project_name = f"yt_test_{uuid.uuid4().hex[:12]}"
-
-        compose_file = self._get_compose_file_abs_path()
-        cmd = [
-            "docker", "compose",
-            "-f", compose_file,
-            "-p", self._compose_project_name,
-            "up", "-d", "--build",
-        ]
-        logger.info("Starting YT cluster with project %s (timeout: 300s)", self._compose_project_name)
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300, check=False)
-        if result.returncode != 0:
-            logger.error("YT cluster startup stderr: %s", result.stderr[:1000])
-            raise RuntimeError(f"Failed to start YT cluster: {result.stderr}")
+        # Project name is the directory containing the compose file
+        return "yt_in_docker"
 
     def _discover_container_name(self) -> str:
         """Discover the running container name for this project."""
@@ -125,31 +80,6 @@ class YtClient:
         if not containers:
             raise RuntimeError("No running containers found for YT cluster")
         return containers[0]
-
-    def _stop_cluster(self) -> None:
-        if self._compose_project_name is None:
-            return
-        if self._managed_by_recipe:
-            # Don't stop — the recipe handles teardown
-            return
-        try:
-            compose_file = self._get_compose_file_abs_path()
-            cmd = [
-                "docker", "compose",
-                "-f", compose_file,
-                "-p", self._compose_project_name,
-                "down", "-v",
-            ]
-            logger.info("Stopping YT cluster %s", self._compose_project_name)
-            subprocess.run(
-                cmd, capture_output=True, text=True, timeout=120, check=False,
-            )
-        except Exception as e:
-            logger.warning("Failed to stop YT cluster: %s", e)
-        finally:
-            self._compose_project_name = None
-            self._container_name = None
-            self._proxy_url = None
 
     def _resolve_proxy_url(self) -> str:
         compose_file = self._get_compose_file_abs_path()
