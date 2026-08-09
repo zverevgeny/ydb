@@ -11,12 +11,24 @@ MESSAGE_COUNT = 1000
 
 
 class TestYtIntegration:
-    """Integration tests with local YT in Docker."""
+    """Integration tests with local YT in Docker.
+
+    Uses scope="class" to start the YT cluster once for all tests in this
+    class, avoiding the expensive startup cost per test. Tests are ordered
+    such that test_yt_connectivity runs first (simple health check) and
+    test_write_and_read_table runs second (full read/write cycle).
+    """
 
     @pytest.fixture(scope="class")
     def yt_client(self):
-        """Create and return YT client."""
-        return YtClient()
+        """Create and return YT client.
+
+        Cluster is started on first use and stopped after all tests in this
+        class complete, via the YtClient context manager protocol.
+        """
+        client = YtClient()
+        yield client
+        client._stop_cluster()
 
     def test_yt_connectivity(self, yt_client):
         """Test basic YT connectivity by listing //tmp via HTTP API."""

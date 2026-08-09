@@ -1,7 +1,6 @@
 services:
   yt:
     build: .
-    container_name: tests-yt-integration-yt
     ports:
       - "80"
     tmpfs:
