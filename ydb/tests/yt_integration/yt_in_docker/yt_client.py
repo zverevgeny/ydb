@@ -47,15 +47,23 @@ class YtClient:
             self._wait_for_healthy(max_attempts, sleep_interval)
         except Exception:
             # On any failure, stop the cluster
-            self._stop_cluster()
+            self.stop()
             raise
 
     def __enter__(self):
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
-        self._stop_cluster()
+        self.stop()
         return False
+
+    def stop(self):
+        """Stop and remove YT cluster.
+
+        Public method for safe external cleanup. Idempotent: safe to call
+        multiple times or when the cluster was never started.
+        """
+        self._stop_cluster()
 
     def _get_compose_file_abs_path(self):
         """Return absolute path to docker-compose.yml."""
@@ -113,7 +121,10 @@ class YtClient:
         return containers[0]
 
     def _stop_cluster(self):
-        """Stop and remove YT cluster."""
+        """Stop and remove YT cluster.
+
+        Internal implementation — use `stop()` for external calls.
+        """
         if self._compose_project_name is None:
             return
         try:
@@ -184,7 +195,7 @@ class YtClient:
                 time.sleep(sleep_interval)
         raise RuntimeError("YT cluster did not become healthy in time")
 
-    def _api_call(self, method, params=None, data=None, timeout=60):
+    def _api_call(self, method, params=None, data=None, timeout=60, max_retries=2):
         """Make a call to YT HTTP API v4.
 
         Args:
@@ -192,6 +203,7 @@ class YtClient:
             params: Query parameters dict
             data: Request body (will be encoded to bytes if string)
             timeout: Request timeout in seconds
+            max_retries: Number of retries for transient failures
 
         Returns:
             Parsed JSON response as dict
@@ -200,20 +212,36 @@ class YtClient:
         if params:
             url += f"?{urlencode(params)}"
 
-        req = urllib.request.Request(url)
-        if data is not None:
-            if isinstance(data, str):
-                data = data.encode()
-            req.data = data
-            req.add_header("Content-Type", "application/json")
+        last_error = None
+        for attempt in range(max_retries + 1):
+            req = urllib.request.Request(url)
+            if data is not None:
+                if isinstance(data, str):
+                    data = data.encode()
+                req.data = data
+                req.add_header("Content-Type", "application/json")
 
-        try:
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
-                return json.loads(resp.read().decode())
-        except urllib.error.HTTPError as e:
-            raise RuntimeError(f"YT API error: {e.code} {e.read().decode()[:500]}")
+            try:
+                with urllib.request.urlopen(req, timeout=timeout) as resp:
+                    return json.loads(resp.read().decode())
+            except urllib.error.HTTPError as e:
+                error_body = e.read().decode()[:1000]
+                last_error = RuntimeError(f"YT API error: {e.code} {error_body}")
+                # Retry on 5xx server errors
+                if e.code >= 500 and attempt < max_retries:
+                    time.sleep(0.5 * attempt)
+                    continue
+                raise last_error
+            except (urllib.error.URLError, OSError) as e:
+                last_error = RuntimeError(f"YT API connection error: {e}")
+                if attempt < max_retries:
+                    time.sleep(0.5 * attempt)
+                    continue
+                raise last_error
 
-    def _run_yt_cli(self, args, check=True, timeout=60, input_data=None):
+        raise last_error
+
+    def _run_yt_cli(self, args, check=True, timeout=60, input_data=None, max_retries=1):
         """Run yt CLI command inside the Docker container via docker exec.
 
         Used for table operations (write-table/read-table) which are not
@@ -224,6 +252,7 @@ class YtClient:
             check: If True, raise exception on non-zero exit code
             timeout: Timeout in seconds
             input_data: Data to pass to stdin
+            max_retries: Number of retries for transient failures
 
         Returns:
             subprocess.CompletedProcess result
@@ -232,10 +261,19 @@ class YtClient:
             cmd = ["docker", "exec", "-i", self._container_name, "yt", "--proxy", "localhost:80"] + args
         else:
             cmd = ["docker", "exec", self._container_name, "yt", "--proxy", "localhost:80"] + args
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, check=False, input=input_data)
-        if check and result.returncode != 0:
-            raise RuntimeError(f"yt command failed: {result.stderr[:500]}")
-        return result
+
+        last_error = None
+        for attempt in range(max_retries + 1):
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, check=False, input=input_data)
+            if not check or result.returncode == 0:
+                return result
+            last_error = RuntimeError(f"yt command failed: {result.stderr[:500]}")
+            if attempt < max_retries:
+                time.sleep(0.5 * attempt)
+                continue
+            raise last_error
+
+        raise last_error
 
     def list(self, path):
         """List nodes at the given path.
@@ -268,7 +306,8 @@ class YtClient:
             self._api_call("remove", params={"path": path})
         except RuntimeError as e:
             # Ignore "node not found" errors — remove is idempotent
-            if "has no child with key" not in str(e):
+            error_str = str(e)
+            if "has no child with key" not in error_str and "not found" not in error_str.lower():
                 raise
 
     def write_table(self, path, rows):
@@ -280,7 +319,8 @@ class YtClient:
         """
         if not rows:
             return
-        data = "\n".join(json.dumps(row) for row in rows)
+        # Join with newlines and add trailing newline for proper JSONL format
+        data = "\n".join(json.dumps(row) for row in rows) + "\n"
         self._run_yt_cli(
             ["write-table", "--format=json", path],
             input_data=data, check=True, timeout=60,

@@ -7,6 +7,7 @@ import pytest
 
 from yt_in_docker.yt_client import YtClient
 
+
 MESSAGE_COUNT = 1000
 
 
@@ -28,7 +29,7 @@ class TestYtIntegration:
         """
         client = YtClient()
         yield client
-        client._stop_cluster()
+        client.stop()
 
     def test_yt_connectivity(self, yt_client):
         """Test basic YT connectivity by listing //tmp via HTTP API."""
