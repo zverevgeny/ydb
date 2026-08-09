@@ -37,13 +37,33 @@ class TestYtIntegration:
 
         try:
             yt_client.remove(table_path)
-            yt_client.create_table(table_path, columns={"key": "string"})
+            yt_client.create_table(
+                table_path,
+                columns={"key": "string", "value": "int64", "label": "string"},
+            )
 
-            rows = [{"key": f"msg_{i}"} for i in range(MESSAGE_COUNT)]
+            rows = [
+                {"key": f"msg_{i}", "value": i, "label": f"tag_{i % 5}"}
+                for i in range(MESSAGE_COUNT)
+            ]
             yt_client.write_table(table_path, rows)
 
             result = yt_client.read_table(table_path)
             assert len(result) == MESSAGE_COUNT, f"Expected {MESSAGE_COUNT} got {len(result)}"
+
+            # Verify all rows match what was written (order may differ)
+            result_sorted = sorted(result, key=lambda r: r["key"])
+            expected_sorted = sorted(rows, key=lambda r: r["key"])
+            for actual, expected in zip(result_sorted, expected_sorted):
+                assert actual["key"] == expected["key"], (
+                    f"Key mismatch: {actual['key']} != {expected['key']}"
+                )
+                assert actual["value"] == expected["value"], (
+                    f"Value mismatch for {actual['key']}: {actual['value']} != {expected['value']}"
+                )
+                assert actual["label"] == expected["label"], (
+                    f"Label mismatch for {actual['key']}: {actual['label']} != {expected['label']}"
+                )
         finally:
             try:
                 yt_client.remove(table_path)

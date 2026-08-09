@@ -197,9 +197,11 @@ class YtClient:
         )
 
     def exists(self, path: str) -> bool:
-        """Check if a node exists at the given path."""
+        """Check if a node exists at the given path. """
         try:
-            self.list(path)
+            self._api_call("get", params={"path": path}, data=json.dumps({
+                "attributes": {"node_type": None}
+            }))
             return True
         except RuntimeError as e:
             error_str = str(e)
