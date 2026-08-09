@@ -58,23 +58,12 @@ class YtClient:
         return False
 
     def stop(self) -> None:
-        """Stop and remove YT cluster.
-
-        Public method for safe external cleanup. Idempotent: safe to call
-        multiple times or when the cluster was never started.
-        """
         self._stop_cluster()
 
     def _get_compose_file_abs_path(self) -> str:
-        """Return absolute path to docker-compose.yml."""
         return yatest.common.source_path(_DOCKER_COMPOSE_FILE_PATH)
 
     def _start_cluster(self) -> None:
-        """Start YT cluster via docker-compose in a temporary directory.
-
-        Uses a unique project name per test run to avoid conflicts
-        between parallel test executions.
-        """
         # Check docker availability first
         try:
             subprocess.run(
@@ -124,10 +113,6 @@ class YtClient:
         return containers[0]
 
     def _stop_cluster(self) -> None:
-        """Stop and remove YT cluster.
-
-        Internal implementation — use `stop()` for external calls.
-        """
         if self._compose_project_name is None:
             return
         try:
@@ -150,11 +135,6 @@ class YtClient:
             self._proxy_url = None
 
     def _resolve_proxy_url(self) -> str:
-        """Resolve the YT proxy URL from docker-compose and return it.
-
-        Handles both IPv4 (127.0.0.1:PORT) and IPv6 ([::1]:PORT) addresses
-        by extracting the host and port separately, then constructing the URL.
-        """
         compose_file = self._get_compose_file_abs_path()
         cmd = [
             "docker", "compose",
@@ -170,9 +150,6 @@ class YtClient:
         if not output:
             raise RuntimeError("docker compose port returned empty output")
 
-        # Parse host:port from docker compose output.
-        # IPv4: 127.0.0.1:12345
-        # IPv6: [::1]:12345
         if output.startswith("["):
             # IPv6 format: [host]:port
             bracket_end = output.rfind("]")
@@ -195,15 +172,6 @@ class YtClient:
         return f"http://localhost:{port}"
 
     def _wait_for_healthy(self, max_attempts: int, sleep_interval: float) -> None:
-        """Wait for YT cluster to become healthy.
-
-        Args:
-            max_attempts: Maximum number of attempts
-            sleep_interval: Sleep between attempts in seconds
-
-        Raises:
-            RuntimeError: If YT doesn't become healthy in time
-        """
         logger.info("Waiting for YT cluster to become healthy (%d attempts)", max_attempts)
         for attempt in range(max_attempts):
             try:
@@ -226,19 +194,6 @@ class YtClient:
         max_retries: int = 2,
         http_method: str = "GET",
     ) -> Dict[str, Any]:
-        """Make a call to YT HTTP API v4.
-
-        Args:
-            method: API method name (list, get, create, remove, etc.)
-            params: Query parameters dict
-            data: Request body (will be encoded to bytes if string)
-            timeout: Request timeout in seconds
-            max_retries: Number of retries for transient failures
-            http_method: HTTP method (GET, POST, etc.)
-
-        Returns:
-            Parsed JSON response as dict
-        """
         url = f"{self._proxy_url}/api/v4/{method}"
         if params:
             url += f"?{urlencode(params)}"
@@ -279,19 +234,6 @@ class YtClient:
         max_retries: int = 1,
     ) -> subprocess.CompletedProcess[str]:
         """Run yt CLI command inside the Docker container via docker exec.
-
-        Used for table operations (write-table/read-table) which are not
-        available through the HTTP API v4.
-
-        Args:
-            args: Command line arguments for yt CLI
-            check: If True, raise exception on non-zero exit code
-            timeout: Timeout in seconds
-            input_data: Data to pass to stdin
-            max_retries: Number of retries for transient failures
-
-        Returns:
-            subprocess.CompletedProcess result
         """
         if input_data is not None:
             cmd = ["docker", "exec", "-i", self._container_name, "yt", "--proxy", "localhost:80"] + args
@@ -312,43 +254,17 @@ class YtClient:
         raise last_error
 
     def list(self, path: str) -> Dict[str, Any]:
-        """List nodes at the given path.
-
-        Args:
-            path: YT path to list
-
-        Returns:
-            JSON response dict with 'value' key containing list of children
-        """
         return self._api_call("list", {"path": path})
 
-    def create_table(self, path: str, columns: Optional[Dict[str, str]] = None) -> None:
-        """Create a table at the given path via HTTP API.
-
-        Args:
-            path: YT table path
-            columns: Optional column schema as {name: type} dict.
-                     If not provided, creates a table without explicit schema
-                     (columns will be auto-created on first write).
-        """
+    def create_table(self, path: str, columns: Dict[str, str]) -> None:
+        """Create a table at the given path with provided schema."""
         params = {"path": path, "type": "table"}
-        if columns:
-            # YT API expects attributes as a map with flattened keys.
-            # columns.0.name, columns.0.type, columns.1.name, columns.1.type, ...
-            for idx, (name, col_type) in enumerate(columns.items()):
-                params[f"columns.{idx}.name"] = name
-                params[f"columns.{idx}.type"] = col_type
+        for idx, (name, col_type) in enumerate(columns.items()):
+            params[f"columns.{idx}.name"] = name
+            params[f"columns.{idx}.type"] = col_type
         self._api_call("create", params=params, http_method="POST")
 
     def exists(self, path: str) -> bool:
-        """Check if a node exists at the given path.
-
-        Args:
-            path: YT path to check
-
-        Returns:
-            True if the node exists, False otherwise
-        """
         try:
             self._api_call("get", params={"path": path})
             return True
@@ -359,14 +275,6 @@ class YtClient:
             raise
 
     def remove(self, path: str, recursive: bool = True) -> None:
-        """Remove a node at the given path.
-
-        Idempotent: does not raise if the node does not exist.
-
-        Args:
-            path: YT path to remove
-            recursive: If True, recursively remove children
-        """
         if not self.exists(path):
             return
         params = {"path": path}
@@ -375,16 +283,8 @@ class YtClient:
         self._api_call("remove", params=params, http_method="POST")
 
     def write_table(self, path: str, rows: List[Dict[str, Any]], timeout: int = 120) -> None:
-        """Write rows to a table.
-
-        Args:
-            path: YT table path
-            rows: List of dicts representing rows. Empty list is a no-op.
-            timeout: Timeout in seconds for the write operation.
-        """
         if not rows:
             return
-        # Join with newlines and add trailing newline for proper JSONL format
         data = "\n".join(json.dumps(row) for row in rows) + "\n"
         self._run_yt_cli(
             ["write-table", "--format=json", path],
@@ -392,14 +292,6 @@ class YtClient:
         )
 
     def read_table(self, path: str) -> List[Dict[str, Any]]:
-        """Read rows from a table.
-
-        Args:
-            path: YT table path
-
-        Returns:
-            List of dicts representing rows
-        """
         result = self._run_yt_cli(
             ["read-table", "--format=json", path],
             timeout=60,
