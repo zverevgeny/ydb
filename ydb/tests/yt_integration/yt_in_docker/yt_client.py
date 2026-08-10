@@ -38,7 +38,9 @@ class YtClient:
         self._compose_project_name: str = self._get_recipe_project_name()
         self._container_name: str = self._discover_container_name()
         self._proxy_url: str = self._resolve_proxy_url()
+        self._rpc_proxy_address: str = self._resolve_rpc_proxy_address()
         self._wait_for_healthy(max_attempts, sleep_interval)
+        self._configure_cluster()
 
     def __enter__(self) -> "YtClient":
         return self
@@ -53,8 +55,13 @@ class YtClient:
 
     @property
     def proxy_url(self) -> str:
-        """Return the YT proxy URL for external tools (e.g. qyt_cli)."""
+        """Return the YT HTTP proxy URL for HTTP API access."""
         return self._proxy_url
+
+    @property
+    def rpc_proxy_address(self) -> str:
+        """Return the YT RPC proxy address (host:port) for RPC-based tools like qyt_cli."""
+        return self._rpc_proxy_address
 
     def _get_compose_file_abs_path(self) -> str:
         return yatest.common.source_path(_DOCKER_COMPOSE_FILE_PATH)
@@ -86,6 +93,23 @@ class YtClient:
             raise RuntimeError("No running containers found for YT cluster")
         return containers[0]
 
+    def _resolve_rpc_proxy_address(self) -> str:
+        compose_file = self._get_compose_file_abs_path()
+        cmd = [
+            "docker", "compose",
+            "-f", compose_file,
+            "-p", self._compose_project_name,
+            "port", "yt", "8443",
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30, check=False)
+        if result.returncode != 0:
+            raise RuntimeError(f"Failed to get YT RPC proxy port: {result.stderr}")
+        output = result.stdout.strip()
+        if not output:
+            raise RuntimeError("docker compose port (8443) returned empty output")
+        port = int(output.rsplit(":", 1)[1])
+        return f"localhost:{port}"
+
     def _resolve_proxy_url(self) -> str:
         compose_file = self._get_compose_file_abs_path()
         cmd = [
@@ -104,6 +128,38 @@ class YtClient:
 
         port = int(output.rsplit(":", 1)[1])
         return f"http://localhost:{port}"
+
+    def _configure_cluster(self) -> None:
+        """Apply one-time configuration to the cluster after it becomes healthy.
+
+        1. Waits until the default tablet cell bundle is healthy so that
+           dynamic tables can be mounted.  The container is started with
+           --wait-tablet-cell-initialization so a cell already exists; this
+           loop just waits for it to finish initialisation.
+        2. Raises the tablet count limit for the //tmp account.
+        """
+        # Wait for the default tablet bundle to become healthy (up to 60 s).
+        logger.info("Waiting for tablet cell bundle to become healthy")
+        for attempt in range(60):
+            result = self._run_yt_cli(
+                ["get", "//sys/tablet_cell_bundles/default/@health"],
+                check=False, timeout=10,
+            )
+            if "good" in result.stdout:
+                logger.info("Tablet bundle healthy after %d attempts", attempt + 1)
+                break
+            time.sleep(1)
+        else:
+            logger.warning("Tablet cell bundle did not become healthy in time")
+
+        # Increase tablet count limit for the tmp account.
+        try:
+            self._run_yt_cli(
+                ["set", "//sys/accounts/tmp/@resource_limits/tablet_count", "1000"],
+                check=True, timeout=30,
+            )
+        except Exception as e:
+            logger.warning("Failed to configure cluster (tablet count limit): %s", e)
 
     def _wait_for_healthy(self, max_attempts: int, sleep_interval: float) -> None:
         logger.info("Waiting for YT cluster to become healthy (%d attempts)", max_attempts)
@@ -220,10 +276,59 @@ class YtClient:
     def remove(self, path: str, recursive: bool = True) -> None:
         if not self.exists(path):
             return
+        # Attempt to unmount dynamic tables before removal; errors are suppressed
+        # for static tables that don't support unmount.
+        try:
+            self._run_yt_cli(
+                ["unmount-table", "--sync", path],
+                check=True, timeout=60,
+            )
+        except Exception:
+            pass
         params = {"path": path}
         if recursive:
             params["recursive"] = "true"
         self._api_call("remove", params=params, http_method="POST")
+
+    def create_queue(self, path: str, data_column: str = "data", timeout: int = 60) -> None:
+        """Create an ordered dynamic table at the given path and mount it as a queue.
+
+        The table is mounted synchronously so it is ready for queue operations
+        immediately after this call returns.
+        """
+        attrs = "{dynamic=%true;schema=[{name=" + data_column + ";type=string}]}"
+        self._run_yt_cli(
+            ["create", "table", path, "--attributes", attrs],
+            check=True, timeout=timeout,
+        )
+        self._run_yt_cli(
+            ["mount-table", path, "--sync"],
+            check=True, timeout=timeout,
+        )
+
+    def register_consumer(
+        self,
+        queue_path: str,
+        consumer_path: str,
+        vital: bool = False,
+        timeout: int = 60,
+    ) -> None:
+        """Register a YT queue consumer linking consumer_path to queue_path."""
+        vital_flag = "--vital" if vital else "--non-vital"
+        self._run_yt_cli(
+            ["register-queue-consumer", queue_path, consumer_path, vital_flag],
+            check=True, timeout=timeout,
+        )
+
+    def insert_rows(self, path: str, rows: List[Dict[str, Any]], timeout: int = 120) -> None:
+        """Insert rows into a mounted dynamic table via JSON newline-delimited format."""
+        if not rows:
+            return
+        data = "\n".join(json.dumps(row) for row in rows) + "\n"
+        self._run_yt_cli(
+            ["insert-rows", "--format=json", path],
+            input_data=data, check=True, timeout=timeout,
+        )
 
     def write_table(self, path: str, rows: List[Dict[str, Any]], timeout: int = 120) -> None:
         if not rows:

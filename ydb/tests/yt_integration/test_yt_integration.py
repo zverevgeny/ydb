@@ -141,26 +141,27 @@ class TestYtIntegration:
         partition information. This test verifies the full path from
         qyt_cli through TQytTopicClient to the YT cluster.
 
-        Note: This test requires queue support in the YT cluster.
-        It will be skipped if @tablet_count is not available.
+        Requires a mounted ordered dynamic table (queue) so that
+        @tablet_count is available on the node.
         """
         table_path = "//tmp/test_describe_topic"
 
         try:
             # Check if qyt_cli is available
             cli_path = _get_qyt_cli_path()
-            if not os.path.isfile(cli_path) or not os.access(cli_path, os.X_OK):
-                pytest.skip(f"qyt_cli not found at {cli_path}")
-
-            # Create a table first (DescribeTopic needs an existing node)
-            yt_client.create_table(
-                table_path,
-                columns={"data": "string"},
+            assert os.path.isfile(cli_path) and os.access(cli_path, os.X_OK), (
+                f"qyt_cli not found at {cli_path}"
             )
 
-            # Run qyt_cli describe-topic with the YT proxy URL
+            # Create a mounted ordered dynamic table — DescribeTopic needs
+            # a node with the @tablet_count attribute, which only exists on
+            # dynamic tables.
+            yt_client.create_queue(table_path)
+
+            # Run qyt_cli describe-topic with the RPC proxy address.
+            # qyt_cli uses the YT RPC protocol, not the HTTP API.
             result = _run_qyt_cli(
-                [yt_client.proxy_url, "describe-topic", table_path], timeout=30
+                [yt_client.rpc_proxy_address, "describe-topic", table_path], timeout=30
             )
 
             # Verify the CLI succeeded
@@ -170,15 +171,98 @@ class TestYtIntegration:
             assert "OK: Topic" in result.stdout, (
                 f"Unexpected output: {result.stdout}"
             )
-        except AssertionError:
-            raise
-        except Exception as e:
-            # If @tablet_count is not available (no queue support), skip
-            error_str = str(e).lower()
-            if "tablet_count" in error_str or "not found" in error_str:
-                pytest.skip(f"Queue support not available: {e}")
-            raise
         finally:
+            try:
+                yt_client.remove(table_path)
+            except Exception:
+                logger.warning("Failed to cleanup table %s", table_path, exc_info=True)
+
+    def test_write_via_qyt_cli(self, yt_client: YtClient) -> None:
+        """Test TQytTopicClient::CreateWriteSession via qyt_cli write command.
+
+        This test verifies the write path through TQytTopicClient to the YT cluster.
+        Requires a mounted ordered dynamic table (queue).
+        """
+        table_path = "//tmp/test_qyt_write"
+        consumer_path = "//tmp/test_qyt_write_consumer"
+
+        try:
+            cli_path = _get_qyt_cli_path()
+            assert os.path.isfile(cli_path) and os.access(cli_path, os.X_OK), (
+                f"qyt_cli not found at {cli_path}"
+            )
+
+            # Create queue as an ordered dynamic table and register a consumer.
+            yt_client.create_queue(table_path)
+            yt_client.register_consumer(table_path, consumer_path)
+
+            # Write messages via qyt_cli using the RPC proxy address.
+            result = _run_qyt_cli(
+                [yt_client.rpc_proxy_address, "write", table_path, consumer_path,
+                 "hello", "world", "qyt"],
+                timeout=30
+            )
+
+            assert result.returncode == 0, (
+                f"qyt_cli write failed: {result.stderr}"
+            )
+            assert "OK: Wrote 3 messages" in result.stdout, (
+                f"Unexpected output: {result.stdout}"
+            )
+        finally:
+            try:
+                yt_client.remove(consumer_path)
+            except Exception:
+                logger.warning("Failed to cleanup consumer %s", consumer_path, exc_info=True)
+            try:
+                yt_client.remove(table_path)
+            except Exception:
+                logger.warning("Failed to cleanup table %s", table_path, exc_info=True)
+
+    def test_read_via_qyt_cli(self, yt_client: YtClient) -> None:
+        """Test TQytTopicClient::CreateReadSession via qyt_cli read command.
+
+        This test verifies the read path through TQytTopicClient to the YT cluster.
+        First writes messages via insert-rows, then reads them back via qyt_cli.
+
+        Requires a mounted ordered dynamic table (queue) with a registered consumer.
+        """
+        table_path = "//tmp/test_qyt_read"
+        consumer_path = "//tmp/test_qyt_read_consumer"
+
+        try:
+            cli_path = _get_qyt_cli_path()
+            assert os.path.isfile(cli_path) and os.access(cli_path, os.X_OK), (
+                f"qyt_cli not found at {cli_path}"
+            )
+
+            # Create queue as an ordered dynamic table, register a consumer,
+            # and insert test data via insert-rows (supported by dynamic tables).
+            yt_client.create_queue(table_path)
+            yt_client.register_consumer(table_path, consumer_path)
+            yt_client.insert_rows(table_path, [
+                {"data": "msg1"},
+                {"data": "msg2"},
+                {"data": "msg3"},
+            ])
+
+            # Read messages via qyt_cli using the RPC proxy address.
+            result = _run_qyt_cli(
+                [yt_client.rpc_proxy_address, "read", table_path, consumer_path, "5"],
+                timeout=30
+            )
+
+            assert result.returncode == 0, (
+                f"qyt_cli read failed: {result.stderr}"
+            )
+            assert "OK: Read" in result.stdout, (
+                f"Unexpected output: {result.stdout}"
+            )
+        finally:
+            try:
+                yt_client.remove(consumer_path)
+            except Exception:
+                logger.warning("Failed to cleanup consumer %s", consumer_path, exc_info=True)
             try:
                 yt_client.remove(table_path)
             except Exception:
