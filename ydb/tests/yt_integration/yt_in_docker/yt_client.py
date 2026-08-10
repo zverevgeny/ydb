@@ -51,6 +51,11 @@ class YtClient:
         # Cluster is managed by the recipe — nothing to stop here
         pass
 
+    @property
+    def proxy_url(self) -> str:
+        """Return the YT proxy URL for external tools (e.g. qyt_cli)."""
+        return self._proxy_url
+
     def _get_compose_file_abs_path(self) -> str:
         return yatest.common.source_path(_DOCKER_COMPOSE_FILE_PATH)
 
@@ -242,3 +247,8 @@ class YtClient:
             except json.JSONDecodeError as e:
                 raise RuntimeError(f"Failed to parse table row: {line!r} — {e}") from None
         return rows
+
+    def get_attribute(self, path: str) -> Any:
+        """Read a single attribute value from the given path (e.g. @tablet_count)."""
+        result = self._api_call("get", params={"path": path})
+        return result.get("value")

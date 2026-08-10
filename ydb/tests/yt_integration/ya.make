@@ -18,6 +18,12 @@ PEERDIR(
     ydb/tests/yt_integration/yt_in_docker
 )
 
+DEPENDS(
+    ydb/library/yql/providers/pq/gateway/clients/qyt/tools
+)
+
+ENV(QYT_CLI_BINARY="ydb/library/yql/providers/pq/gateway/clients/qyt/tools/qyt_cli")
+
 TEST_SRCS(
     test_yt_integration.py
 )

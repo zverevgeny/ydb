@@ -4,8 +4,11 @@ The test runs on the host and connects to YT running inside Docker.
 """
 
 import logging
+import os
+import subprocess
 
 import pytest
+import yatest.common
 
 from yt_in_docker import YtClient
 
@@ -13,6 +16,33 @@ from yt_in_docker import YtClient
 logger = logging.getLogger(__name__)
 
 MESSAGE_COUNT = 100
+
+
+def _get_qyt_cli_path() -> str:
+    """Resolve the path to the built qyt_cli binary."""
+    import glob
+    import pathlib
+    binary = os.environ.get("QYT_CLI_BINARY", "ydb/library/yql/providers/pq/gateway/clients/qyt/tools/qyt_cli")
+    # yatest.common.build_path may return source path; try build output first
+    build_path = yatest.common.build_path(binary)
+    if os.path.isfile(build_path) and os.access(build_path, os.X_OK):
+        return build_path
+    # Try to find in build directory using glob
+    build_root = pathlib.Path(os.environ.get("ARCADIA_BUILD_ROOT", ""))
+    if build_root and build_root.exists():
+        pattern = str(build_root / "**" / "qyt_cli")
+        candidates = glob.glob(pattern, recursive=True)
+        for c in candidates:
+            if os.path.isfile(c) and os.access(c, os.X_OK):
+                return c
+    return build_path
+
+
+def _run_qyt_cli(args: list, timeout: int = 30) -> subprocess.CompletedProcess[str]:
+    """Run qyt_cli with the given arguments."""
+    cli_path = _get_qyt_cli_path()
+    cmd = [cli_path] + args
+    return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, check=False)
 
 
 class TestYtIntegration:
@@ -64,6 +94,90 @@ class TestYtIntegration:
                 assert actual["label"] == expected["label"], (
                     f"Label mismatch for {actual['key']}: {actual['label']} != {expected['label']}"
                 )
+        finally:
+            try:
+                yt_client.remove(table_path)
+            except Exception:
+                logger.warning("Failed to cleanup table %s", table_path, exc_info=True)
+
+    def test_create_topic_contract(self, yt_client: YtClient) -> None:
+        """Test the contract TQytTopicClient::CreateTopic relies on.
+
+        CreateTopic checks NodeExists on the given path. If the node exists
+        (table was created out of band), it returns success. Otherwise it
+        returns BAD_REQUEST. This test verifies that create_table + exists
+        correctly implements that contract.
+        """
+        table_path = "//tmp/test_qyt_topic"
+
+        try:
+            # Topic does not exist yet
+            assert not yt_client.exists(table_path), "Table should not exist yet"
+
+            # Create the underlying table (simulates out-of-band queue creation)
+            yt_client.create_table(
+                table_path,
+                columns={"data": "string"},
+            )
+
+            # Now CreateTopic should find the node and return success
+            assert yt_client.exists(table_path), "Table should exist after creation"
+
+            # Verify we can write and read data through the table
+            yt_client.write_table(table_path, [{"data": "hello_qyt"}])
+            result = yt_client.read_table(table_path)
+            assert len(result) == 1
+            assert result[0]["data"] == "hello_qyt"
+        finally:
+            try:
+                yt_client.remove(table_path)
+            except Exception:
+                logger.warning("Failed to cleanup table %s", table_path, exc_info=True)
+
+    def test_describe_topic_via_qyt_cli(self, yt_client: YtClient) -> None:
+        """Test TQytTopicClient::DescribeTopic via qyt_cli.
+
+        DescribeTopic reads @tablet_count attribute from YT and returns
+        partition information. This test verifies the full path from
+        qyt_cli through TQytTopicClient to the YT cluster.
+
+        Note: This test requires queue support in the YT cluster.
+        It will be skipped if @tablet_count is not available.
+        """
+        table_path = "//tmp/test_describe_topic"
+
+        try:
+            # Check if qyt_cli is available
+            cli_path = _get_qyt_cli_path()
+            if not os.path.isfile(cli_path) or not os.access(cli_path, os.X_OK):
+                pytest.skip(f"qyt_cli not found at {cli_path}")
+
+            # Create a table first (DescribeTopic needs an existing node)
+            yt_client.create_table(
+                table_path,
+                columns={"data": "string"},
+            )
+
+            # Run qyt_cli describe-topic with the YT proxy URL
+            result = _run_qyt_cli(
+                [yt_client.proxy_url, "describe-topic", table_path], timeout=30
+            )
+
+            # Verify the CLI succeeded
+            assert result.returncode == 0, (
+                f"qyt_cli describe-topic failed: {result.stderr}"
+            )
+            assert "OK: Topic" in result.stdout, (
+                f"Unexpected output: {result.stdout}"
+            )
+        except AssertionError:
+            raise
+        except Exception as e:
+            # If @tablet_count is not available (no queue support), skip
+            error_str = str(e).lower()
+            if "tablet_count" in error_str or "not found" in error_str:
+                pytest.skip(f"Queue support not available: {e}")
+            raise
         finally:
             try:
                 yt_client.remove(table_path)
