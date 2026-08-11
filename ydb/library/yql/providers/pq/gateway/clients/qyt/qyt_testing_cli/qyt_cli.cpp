@@ -1,7 +1,11 @@
 #include "../yql_qyt_topic_client.h"
 
+#include <yt/yt/client/api/client.h>
 #include <yt/yt/client/api/rpc_proxy/config.h>
 #include <yt/yt/client/api/rpc_proxy/connection.h>
+#include <yt/yt/client/api/transaction.h>
+
+#include <yt/yt/core/actions/future.h>
 
 #include <iostream>
 #include <optional>
@@ -12,17 +16,35 @@ using namespace NYql;
 
 static void PrintUsage() {
     std::cerr << "Usage: qyt_cli <proxy> <command> <args...>\n"
-              << "Commands:\n"
+              << "\nProxy format: host:port (without http:// prefix)\n"
+              << "  Example: qyt_cli localhost:8443 describe-topic //tmp/my_queue\n"
+              << "\nCommands:\n"
               << "  describe-topic <path>                  - Describe topic (check exists + partitions)\n"
+              << "  describe-consumer <path> <consumer>    - Describe consumer\n"
+              << "  describe-partition <path> <partition>  - Describe partition\n"
               << "  write <path> <consumer> <msg1> [msg2]  - Write messages to topic\n"
               << "  read <path> <consumer> [max_events]    - Read messages from topic\n"
-              << "  commit <path> <consumer> <offset>      - Commit offset for consumer\n";
+              << "  commit <path> <consumer> <offset>      - Commit offset for consumer\n"
+              << "  get <path>                             - Check if node exists\n";
 }
 
 static NYT::NApi::IClientPtr CreateYtClient(const std::string& proxy) {
     auto connectionConfig = NYT::New<NYT::NApi::NRpcProxy::TConnectionConfig>();
-    connectionConfig->ClusterUrl = proxy;
-    connectionConfig->ConnectionType = NYT::NApi::EConnectionType::Rpc;
+
+    // Strip http:// or https:// prefix if present — the RPC transport needs a
+    // bare host:port address, not an HTTP URL.
+    std::string rpcProxy = proxy;
+    if (rpcProxy.size() > 7 && rpcProxy.substr(0, 7) == "http://") {
+        rpcProxy = rpcProxy.substr(7);
+    } else if (rpcProxy.size() > 8 && rpcProxy.substr(0, 8) == "https://") {
+        rpcProxy = rpcProxy.substr(8);
+    }
+
+    // Set the proxy address directly and disable HTTP-based proxy list
+    // discovery. In test environments the proxy list endpoint may return
+    // internal container addresses that are unreachable from the host.
+    connectionConfig->ProxyAddresses = std::vector<std::string>{rpcProxy};
+    connectionConfig->EnableProxyDiscovery = false;
 
     auto connection = NYT::NApi::NRpcProxy::CreateConnection(connectionConfig);
     return connection->CreateClient(NYT::NApi::TClientOptions());
@@ -58,7 +80,7 @@ int main(int argc, char* argv[]) {
             std::cout << "OK: Topic " << path << " exists\n";
             return 0;
         } else {
-            std::cerr << "DescribeTopic failed\n";
+            std::cerr << "DescribeTopic failed: " << result.GetIssues().ToString() << "\n";
             return 1;
         }
 
@@ -222,6 +244,58 @@ int main(int argc, char* argv[]) {
             return 0;
         } else {
             std::cerr << "CommitOffset failed\n";
+            return 1;
+        }
+
+    } else if (command == "describe-consumer") {
+        if (argc < 6) {
+            std::cerr << "describe-consumer requires <path> <consumer>\n";
+            return 1;
+        }
+        TString path(argv[3]);
+        TString consumer(argv[4]);
+        auto future = topicClient->DescribeConsumer(path, consumer, {});
+        auto result = future.ExtractValue();
+        if (result.IsSuccess()) {
+            std::cout << "OK: Consumer " << consumer << " on topic " << path << "\n";
+            return 0;
+        } else {
+            std::cerr << "DescribeConsumer failed: " << result.GetIssues().ToString() << "\n";
+            return 1;
+        }
+
+    } else if (command == "describe-partition") {
+        if (argc < 6) {
+            std::cerr << "describe-partition requires <path> <partition>\n";
+            return 1;
+        }
+        TString path(argv[3]);
+        i64 partitionId = std::stoll(argv[4]);
+        auto future = topicClient->DescribePartition(path, partitionId, {});
+        auto result = future.ExtractValue();
+        if (result.IsSuccess()) {
+            std::cout << "OK: Partition " << partitionId << " on topic " << path << "\n";
+            return 0;
+        } else {
+            std::cerr << "DescribePartition failed: " << result.GetIssues().ToString() << "\n";
+            return 1;
+        }
+
+    } else if (command == "get") {
+        if (argc < 4) {
+            std::cerr << "get requires <path>\n";
+            return 1;
+        }
+        const TString path(argv[3]);
+
+        try {
+            auto node = NYT::NConcurrency::WaitFor(
+                ytClient->GetNode(path)).ValueOrThrow();
+
+            std::cout << "OK: " << path << " exists\n";
+            return 0;
+        } catch (const std::exception& ex) {
+            std::cerr << "Get failed: " << ex.what() << "\n";
             return 1;
         }
 
