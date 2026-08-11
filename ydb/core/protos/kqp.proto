@@ -928,6 +928,9 @@ message TKqpTableSinkSettings {
     optional bool SkipMissingRows = 28;
     optional EInputRowFormat InputRowFormat = 29 [default = INPUT_ROW_FORMAT_FLAT];
     repeated uint64 TargetShardIds = 30; //TODO temporary for verification purpose. Remove me before commit
+    // Expected node ID for task scheduling affinity.
+    // When set, the task will be scheduled on the specified node.
+    optional uint64 ExpectedNodeId = 31;
 }
 
 message TReadVectorTopK {
