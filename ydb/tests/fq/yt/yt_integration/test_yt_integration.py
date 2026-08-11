@@ -10,7 +10,7 @@ import subprocess
 import pytest
 import yatest.common
 
-from yt_in_docker import YtClient
+from ydb.tests.fq.yt.yt_in_docker import YtClient
 
 
 logger = logging.getLogger(__name__)

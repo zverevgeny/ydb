@@ -18,7 +18,7 @@ import yatest.common
 
 logger = logging.getLogger(__name__)
 
-_DOCKER_COMPOSE_FILE_PATH = "ydb/tests/yt_integration/yt_in_docker/docker-compose.yml"
+_DOCKER_COMPOSE_FILE_PATH = "ydb/tests/fq/yt/yt_in_docker/docker-compose.yml"
 
 
 class YtClient:

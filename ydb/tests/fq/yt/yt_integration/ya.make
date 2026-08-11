@@ -7,7 +7,7 @@ PY3TEST()
 # a local package resolved at runtime via the peer dependency below.
 NO_CHECK_IMPORTS()
 
-SET(DOCKER_COMPOSE_FILE ydb/tests/yt_integration/yt_in_docker/docker-compose.yml)
+SET(DOCKER_COMPOSE_FILE ydb/tests/fq/yt/yt_in_docker/docker-compose.yml)
 
 ENV(COMPOSE_HTTP_TIMEOUT=600)
 
@@ -15,7 +15,11 @@ INCLUDE(${ARCADIA_ROOT}/library/recipes/docker_compose/recipe.inc)
 
 PEERDIR(
     contrib/python/pytest
-    ydb/tests/yt_integration/yt_in_docker
+    ydb/tests/fq/yt/yt_in_docker
+)
+
+DATA(
+    arcadia/ydb/tests/fq/yt/yt_in_docker
 )
 
 DEPENDS(
