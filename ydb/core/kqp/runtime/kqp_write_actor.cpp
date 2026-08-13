@@ -464,8 +464,7 @@ public:
         const IKqpTransactionManagerPtr& txManager,
         const TActorId sessionActorId,
         TIntrusivePtr<TKqpCounters> counters,
-        TIntrusivePtr<NACLib::TUserContext> userCtx,
-        THashSet<ui64> targetShardIds = {})
+        TIntrusivePtr<NACLib::TUserContext> userCtx)
         : MessageSettings(GetWriteActorSettings())
         , Alloc(alloc)
         , MvccSnapshot(mvccSnapshot)
@@ -2907,20 +2906,14 @@ public:
                 keyColumnTypes.push_back(typeInfoMod.TypeInfo);
             }
 
-            // Pass TargetShardIds from sink settings into the write controller.
-            // When non-empty, the controller will only write to the specified shards
-            // (rows destined for other shards are discarded — they belong to another task).
-            THashSet<ui64> targetShardIds(
-                Settings.GetTargetShardIds().begin(),
-                Settings.GetTargetShardIds().end());
-
-            if (!targetShardIds.empty()) {
+            THashSet<ui64> targetShardIds;
+            if (Settings.GetTargetShardIds().size() > 0) {
+                targetShardIds.insert(Settings.GetTargetShardIds().begin(), Settings.GetTargetShardIds().end());
                 YDB_LOG_INFO("CsWriteAffinity: DirectWriteActor initialized with shard affinity",
                     {"logPrefix", this->LogPrefix},
                     {"targetShardCount", targetShardIds.size()},
                     {"expectedNodeId", Settings.GetExpectedNodeId()});
             }
-
             WriteTableActor = new TKqpTableWriteActor(
                 this,
                 Settings.GetDatabase(),
@@ -2938,8 +2931,8 @@ public:
                 nullptr,
                 TActorId{},
                 Counters,
-                UserCtx,
-                std::move(targetShardIds));
+                UserCtx
+            );
             // Set initial QuerySpanId for direct write actor
             WriteTableActor->SetCurrentQuerySpanId(Settings.GetQuerySpanId());
 
