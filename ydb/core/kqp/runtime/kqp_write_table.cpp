@@ -670,7 +670,7 @@ private:
 
     std::shared_ptr<NKikimr::NMiniKQL::TScopedAlloc> Alloc;
 
-    THashSet<ui64> TargetShardIds;
+    std::optional<THashSet<ui64>> TargetShardIds;
 
     THashMap<ui64, TUnpreparedBatch> UnpreparedBatches;
     TBatches Batches;

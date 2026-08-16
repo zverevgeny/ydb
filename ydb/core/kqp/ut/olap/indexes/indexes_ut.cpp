@@ -1066,7 +1066,8 @@ Y_UNIT_TEST_SUITE(KqpOlapIndexes) {
             )
             PARTITION BY HASH (`key`)
             WITH (
-                STORE = COLUMN
+                STORE = COLUMN,
+                PARTITION_COUNT = 4
             );
         )");
 

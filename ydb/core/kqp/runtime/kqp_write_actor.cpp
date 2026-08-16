@@ -2906,14 +2906,6 @@ public:
                 keyColumnTypes.push_back(typeInfoMod.TypeInfo);
             }
 
-            THashSet<ui64> targetShardIds;
-            if (Settings.GetTargetShardIds().size() > 0) {
-                targetShardIds.insert(Settings.GetTargetShardIds().begin(), Settings.GetTargetShardIds().end());
-                YDB_LOG_INFO("CsWriteAffinity: DirectWriteActor initialized with shard affinity",
-                    {"logPrefix", this->LogPrefix},
-                    {"targetShardCount", targetShardIds.size()},
-                    {"expectedNodeId", Settings.GetExpectedNodeId()});
-            }
             WriteTableActor = new TKqpTableWriteActor(
                 this,
                 Settings.GetDatabase(),
@@ -2931,8 +2923,7 @@ public:
                 nullptr,
                 TActorId{},
                 Counters,
-                UserCtx
-            );
+                UserCtx);
             // Set initial QuerySpanId for direct write actor
             WriteTableActor->SetCurrentQuerySpanId(Settings.GetQuerySpanId());
 
