@@ -1465,7 +1465,7 @@ void TKqpTasksGraph::BuildKqpStageChannels(TStageInfo& stageInfo, ui64 txId, boo
                 break;
             }
             case NKqpProto::TKqpPhyConnection::kBroadcast: {
-                // CsWriteAffinity: If this is a CTAS affinity Sink Stage (CtasShardingColumns
+                // CsWriteAffinity: If this is an OLAP affinity Sink Stage (CsShardingColumns
                 // populated by the table resolver) AND we have M>1 tasks (one per shard),
                 // replace the Broadcast connection with ColumnShardHashV1 HashShuffle.
                 //
@@ -1479,7 +1479,7 @@ void TKqpTasksGraph::BuildKqpStageChannels(TStageInfo& stageInfo, ui64 txId, boo
                 //
                 // The params are stored on the Transform Stage (inputStageInfo) so that
                 // FillOutputDesc serializes them into the Transform Stage's task output descriptor.
-                if (!stageInfo.Meta.CtasShardingColumns.empty()
+                if (!stageInfo.Meta.CsShardingColumns.empty()
                         && stageInfo.Tasks.size() > 1
                         && stageInfo.Meta.ShardKey
                         && !stageInfo.Meta.ShardKey->GetPartitions().empty()
@@ -1526,18 +1526,18 @@ void TKqpTasksGraph::BuildKqpStageChannels(TStageInfo& stageInfo, ui64 txId, boo
                     }
 
                     if (allResolved) {
-                        // Derive key column types from table schema (stored in CtasShardingColumns).
+                        // Derive key column types from table schema (stored in CsShardingColumns).
                         auto keyTypes = std::make_shared<TVector<NScheme::TTypeInfo>>();
                         if (stageInfo.Meta.ColumnTableInfoPtr) {
                             const auto& tableConstInfo = stageInfo.Meta.TableConstInfo;
-                            for (const auto& colName : stageInfo.Meta.CtasShardingColumns) {
+                            for (const auto& colName : stageInfo.Meta.CsShardingColumns) {
                                 if (tableConstInfo && tableConstInfo->Columns.contains(colName)) {
                                     keyTypes->push_back(tableConstInfo->Columns.at(colName).Type);
                                 }
                             }
                         }
 
-                        if (keyTypes->size() == stageInfo.Meta.CtasShardingColumns.size()) {
+                        if (keyTypes->size() == stageInfo.Meta.CsShardingColumns.size()) {
                             // Set ColumnShardHashV1Params on the upstream Transform Stage.
                             auto& transformParams = inputStageInfo.Meta.ColumnShardHashV1Params;
                             transformParams.SourceShardCount = N;
@@ -1546,7 +1546,7 @@ void TKqpTasksGraph::BuildKqpStageChannels(TStageInfo& stageInfo, ui64 txId, boo
 
                             // Use HashShuffle instead of Broadcast for correct per-shard routing.
                             BuildHashShuffleChannels(*this, stageInfo, inputIdx, inputStageInfo, outputIdx,
-                                stageInfo.Meta.CtasShardingColumns, enableSpilling, log,
+                                stageInfo.Meta.CsShardingColumns, enableSpilling, log,
                                 EHashShuffleFuncType::ColumnShardHashV1);
                             break;
                         }
@@ -1577,8 +1577,60 @@ void TKqpTasksGraph::BuildKqpStageChannels(TStageInfo& stageInfo, ui64 txId, boo
                 }
 
                 if (isOlapSinkWithMultipleTasks) {
-                    // Use Broadcast instead of Map for OLAP sinks with per-shard affinity.
-                    // Each sink task will filter to its own shard using TargetShardIds.
+                    // For OLAP sinks with per-shard affinity, try to use ColumnShardHashV1
+                    // HashShuffle instead of Map to route each row to exactly one sink task.
+                    // If ColumnShardHashV1 params are available, use them; otherwise fall back
+                    // to Broadcast as a safe default.
+                    if (!stageInfo.Meta.CsShardingColumns.empty()
+                            && stageInfo.Meta.ShardKey
+                            && !stageInfo.Meta.ShardKey->GetPartitions().empty()
+                            && GetMeta().ShardsResolved) {
+                        // Reuse the same ColumnShardHashV1 logic as in kBroadcast case above.
+                        const ui32 N = stageInfo.Meta.ShardKey->GetPartitions().size();
+                        TVector<ui64> resolvedShardIds;
+                        for (const auto& partition : stageInfo.Meta.ShardKey->GetPartitions()) {
+                            if (GetMeta().ShardIdToNodeId.contains(partition.ShardId)) {
+                                resolvedShardIds.push_back(partition.ShardId);
+                            }
+                        }
+                        THashMap<ui64, ui32> shardToTaskIdx;
+                        for (ui32 ti = 0; ti < stageInfo.Tasks.size() && ti < resolvedShardIds.size(); ++ti) {
+                            shardToTaskIdx[resolvedShardIds[ti]] = ti;
+                        }
+                        auto taskIndexByHash = std::make_shared<TVector<ui64>>(N, 0);
+                        bool allResolved = true;
+                        for (ui32 i = 0; i < N; ++i) {
+                            const ui64 shardId = stageInfo.Meta.ShardKey->GetPartitions()[i].ShardId;
+                            auto itTask = shardToTaskIdx.find(shardId);
+                            if (itTask == shardToTaskIdx.end()) {
+                                allResolved = false;
+                                break;
+                            }
+                            (*taskIndexByHash)[i] = itTask->second;
+                        }
+                        if (allResolved) {
+                            auto keyTypes = std::make_shared<TVector<NScheme::TTypeInfo>>();
+                            if (stageInfo.Meta.ColumnTableInfoPtr) {
+                                const auto& tableConstInfo = stageInfo.Meta.TableConstInfo;
+                                for (const auto& colName : stageInfo.Meta.CsShardingColumns) {
+                                    if (tableConstInfo && tableConstInfo->Columns.contains(colName)) {
+                                        keyTypes->push_back(tableConstInfo->Columns.at(colName).Type);
+                                    }
+                                }
+                            }
+                            if (keyTypes->size() == stageInfo.Meta.CsShardingColumns.size()) {
+                                auto& transformParams = inputStageInfo.Meta.ColumnShardHashV1Params;
+                                transformParams.SourceShardCount = N;
+                                transformParams.TaskIndexByHash = std::move(taskIndexByHash);
+                                transformParams.SourceTableKeyColumnTypes = std::move(keyTypes);
+                                BuildHashShuffleChannels(*this, stageInfo, inputIdx, inputStageInfo, outputIdx,
+                                    stageInfo.Meta.CsShardingColumns, enableSpilling, log,
+                                    EHashShuffleFuncType::ColumnShardHashV1);
+                                break;
+                            }
+                        }
+                    }
+                    // Fall back to Broadcast if ColumnShardHashV1 couldn't be built.
                     BuildBroadcastChannels(*this, stageInfo, inputIdx, inputStageInfo, outputIdx, enableSpilling, log);
                 } else {
                     BuildMapChannels(*this, stageInfo, inputIdx, inputStageInfo, outputIdx, enableSpilling, log);

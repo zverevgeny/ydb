@@ -96,7 +96,7 @@ struct TStageInfoMeta {
     // Populated by TKqpTableResolver from ColumnTableInfoPtr during name resolution.
     // Used in BuildKqpStageChannels to configure ColumnShardHashV1 shuffle on the upstream
     // Transform Stage so rows are routed directly to the node owning each target shard.
-    std::vector<TString> CtasShardingColumns;
+    std::vector<TString> CsShardingColumns;
     std::unordered_map<TString, TActorId> ControlPlaneActors;
 
     TVector<bool> SkipNullKeys;

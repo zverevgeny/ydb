@@ -285,7 +285,20 @@ private:
                     const auto& desc = entry.ColumnTableInfo->Description;
                     if (desc.HasSharding() && desc.GetSharding().HasHashSharding()) {
                         for (const auto& col : desc.GetSharding().GetHashSharding().GetColumns()) {
-                            stageMeta.CtasShardingColumns.emplace_back(col);
+                            stageMeta.CsShardingColumns.emplace_back(col);
+                        }
+
+                        // Populate ShardKey with ColumnShard partitions for ColumnShardHashV1 routing.
+                        // This is needed for INSERT (not just CTAS/FILL) to enable per-shard routing.
+                        TVector<TKeyDesc::TPartitionInfo> partitions;
+                        for (const auto& shardId : desc.GetSharding().GetColumnShards()) {
+                            partitions.emplace_back(shardId);
+                        }
+                        if (!partitions.empty()) {
+                            if (!stageMeta.ShardKey) {
+                                stageMeta.ShardKey = TKeyDesc::CreateMiniKeyDesc(TVector<NScheme::TTypeInfo>{});
+                            }
+                            stageMeta.ShardKey->Partitioning = std::make_shared<TPartitioning>(std::move(partitions));
                         }
                     }
                 }
