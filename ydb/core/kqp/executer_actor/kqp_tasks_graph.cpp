@@ -1400,6 +1400,31 @@ void TKqpTasksGraph::BuildKqpStageChannels(TStageInfo& stageInfo, ui64 txId, boo
     }
 
     ui64 nextOriginTaskId = 0;
+    {
+        bool hasOlapSink = false;
+        for (const auto& sink : stage.GetSinks()) {
+            if (sink.HasInternalSink()
+                    && sink.GetInternalSink().GetSettings().Is<NKikimrKqp::TKqpTableSinkSettings>()) {
+                NKikimrKqp::TKqpTableSinkSettings ss;
+                if (sink.GetInternalSink().GetSettings().UnpackTo(&ss) && ss.GetIsOlap()) {
+                    hasOlapSink = true;
+                }
+            }
+        }
+        TStringBuilder inputTypes;
+        for (const auto& input : stage.GetInputs()) {
+            inputTypes << (int)input.GetTypeCase() << ",";
+        }
+        Cerr << "CSDBG stage tx=" << stageInfo.Id.TxId << " stageId=" << stageInfo.Id.StageId
+             << " tasks=" << stageInfo.Tasks.size()
+             << " sinks=" << stage.GetSinks().size()
+             << " hasOlapSink=" << hasOlapSink
+             << " inputs=" << stage.GetInputs().size()
+             << " inputTypes=[" << inputTypes << "]"
+             << " CsShardingColumns=" << stageInfo.Meta.CsShardingColumns.size()
+             << Endl;
+    }
+
     for (const auto& input : stage.GetInputs()) {
         ui32 inputIdx = input.GetInputIndex();
         auto& inputStageInfo = GetStageInfo(TStageId(stageInfo.Id.TxId, input.GetStageIndex()));
@@ -1479,46 +1504,66 @@ void TKqpTasksGraph::BuildKqpStageChannels(TStageInfo& stageInfo, ui64 txId, boo
                 //
                 // The params are stored on the Transform Stage (inputStageInfo) so that
                 // FillOutputDesc serializes them into the Transform Stage's task output descriptor.
+                Cerr << "CSDBG kBroadcast gate:"
+                     << " CsShardingColumns=" << stageInfo.Meta.CsShardingColumns.size()
+                     << " Tasks=" << stageInfo.Tasks.size()
+                     << " ShardKey=" << (bool)stageInfo.Meta.ShardKey
+                     << " Partitions=" << (stageInfo.Meta.ShardKey ? stageInfo.Meta.ShardKey->GetPartitions().size() : 0)
+                     << " ShardsResolved=" << GetMeta().ShardsResolved
+                     << Endl;
                 if (!stageInfo.Meta.CsShardingColumns.empty()
                         && stageInfo.Tasks.size() > 1
                         && stageInfo.Meta.ShardKey
                         && !stageInfo.Meta.ShardKey->GetPartitions().empty()
                         && GetMeta().ShardsResolved) {
 
-                    const ui32 N = stageInfo.Meta.ShardKey->GetPartitions().size();
-
-                    // Build a map: shardId → taskIdx within stageInfo.Tasks.
+                    // Canonical shard order = ColumnShard sharding bucket order.
                     //
-                    // CountComputeTasks created one task per resolved shard (those present
-                    // in ShardIdToNodeId), in GetPartitions() order. So the task at index ti
-                    // owns the ti-th resolved shard. We collect resolved shards in the same
-                    // order and map each shardId to its task index.
+                    // The runtime ColumnShardHashV1 function maps hash(pk) to a "bucket"
+                    // i = hash / (Max/N), and the ColumnShard sharding assigns that bucket
+                    // to shardId = OrderedShardIds[i] (see IShardingBase / hash_intervals.cpp).
+                    // OrderedShardIds is exactly GetSharding().GetColumnShards().
                     //
-                    // NOTE: We key by shardId (not nodeId) because multiple tasks can be
-                    // pinned to the same node — one per shard. A nodeId→taskIdx map would
-                    // only keep the last task per node, breaking routing for other shards.
-                    TVector<ui64> resolvedShardIds;
-                    for (const auto& partition : stageInfo.Meta.ShardKey->GetPartitions()) {
-                        if (GetMeta().ShardIdToNodeId.contains(partition.ShardId)) {
-                            resolvedShardIds.push_back(partition.ShardId);
+                    // CountComputeTasks and BuildInternalSinks BOTH iterate GetColumnShards()
+                    // to create tasks and assign TargetShardIds. Therefore TaskIndexByHash must
+                    // be built over the SAME GetColumnShards() order — NOT over
+                    // ShardKey->GetPartitions(), whose order (and ShardIdToNodeId filtering)
+                    // may diverge and route rows to the wrong Sink task.
+                    TVector<ui64> orderedShardIds;
+                    if (stageInfo.Meta.ColumnTableInfoPtr
+                            && stageInfo.Meta.ColumnTableInfoPtr->Description.HasSharding()) {
+                        const auto& sharding = stageInfo.Meta.ColumnTableInfoPtr->Description.GetSharding();
+                        for (const auto& shardId : sharding.GetColumnShards()) {
+                            orderedShardIds.push_back(shardId);
+                        }
+                    } else {
+                        for (const auto& partition : stageInfo.Meta.ShardKey->GetPartitions()) {
+                            orderedShardIds.push_back(partition.ShardId);
                         }
                     }
 
+                    const ui32 N = orderedShardIds.size();
+
+                    // Build a map: shardId → taskIdx within stageInfo.Tasks.
+                    // Tasks were created in orderedShardIds order (one task per shard), so the
+                    // task at index ti owns orderedShardIds[ti].
+                    //
+                    // NOTE: We key by shardId (not nodeId) because multiple tasks can be
+                    // pinned to the same node — one per shard.
                     THashMap<ui64 /* shardId */, ui32 /* taskIdx */> shardToTaskIdx;
-                    for (ui32 ti = 0; ti < stageInfo.Tasks.size() && ti < resolvedShardIds.size(); ++ti) {
-                        shardToTaskIdx[resolvedShardIds[ti]] = ti;
+                    for (ui32 ti = 0; ti < stageInfo.Tasks.size() && ti < orderedShardIds.size(); ++ti) {
+                        shardToTaskIdx[orderedShardIds[ti]] = ti;
                     }
 
-                    // Build TaskIndexByHash[0..N-1]: bucket i → taskIdx
-                    // Bucket i corresponds to the shard at position i in GetPartitions().
+                    // Build TaskIndexByHash[0..N-1]: bucket i → taskIdx.
+                    // Bucket i corresponds to shardId = orderedShardIds[i] (ColumnShard contract).
                     auto taskIndexByHash = std::make_shared<TVector<ui64>>(N, 0);
                     bool allResolved = true;
                     for (ui32 i = 0; i < N; ++i) {
-                        const ui64 shardId = stageInfo.Meta.ShardKey->GetPartitions()[i].ShardId;
+                        const ui64 shardId = orderedShardIds[i];
                         auto itTask = shardToTaskIdx.find(shardId);
                         if (itTask == shardToTaskIdx.end()) {
-                            // This shard was not resolved (not in ShardIdToNodeId) or has no
-                            // dedicated task. Fall back to Broadcast for the whole stage.
+                            // Shard has no dedicated task — fall back to Broadcast.
                             allResolved = false;
                             break;
                         }
@@ -1537,14 +1582,26 @@ void TKqpTasksGraph::BuildKqpStageChannels(TStageInfo& stageInfo, ui64 txId, boo
                             }
                         }
 
+                        Cerr << "CSDBG kBroadcast inner: N=" << N
+                             << " allResolved=" << allResolved
+                             << " keyTypes=" << keyTypes->size()
+                             << " CsShardingColumns=" << stageInfo.Meta.CsShardingColumns.size()
+                             << " ColumnTableInfoPtr=" << (bool)stageInfo.Meta.ColumnTableInfoPtr
+                             << " TableConstInfo=" << (bool)stageInfo.Meta.TableConstInfo
+                             << Endl;
                         if (keyTypes->size() == stageInfo.Meta.CsShardingColumns.size()) {
                             // Set ColumnShardHashV1Params on the upstream Transform Stage.
                             auto& transformParams = inputStageInfo.Meta.ColumnShardHashV1Params;
                             transformParams.SourceShardCount = N;
+                            for (ui32 i = 0; i < N; ++i) {
+                                Cerr << "CSDBG TaskIndexByHash[" << i << "]=" << (*taskIndexByHash)[i]
+                                     << " shardId=" << orderedShardIds[i] << Endl;
+                            }
                             transformParams.TaskIndexByHash = std::move(taskIndexByHash);
                             transformParams.SourceTableKeyColumnTypes = std::move(keyTypes);
 
                             // Use HashShuffle instead of Broadcast for correct per-shard routing.
+                            Cerr << "CSDBG kBroadcast -> HashShuffle(ColumnShardHashV1)" << Endl;
                             BuildHashShuffleChannels(*this, stageInfo, inputIdx, inputStageInfo, outputIdx,
                                 stageInfo.Meta.CsShardingColumns, enableSpilling, log,
                                 EHashShuffleFuncType::ColumnShardHashV1);
@@ -1553,6 +1610,7 @@ void TKqpTasksGraph::BuildKqpStageChannels(TStageInfo& stageInfo, ui64 txId, boo
                     }
                     // Fall through to Broadcast if params couldn't be resolved.
                 }
+                Cerr << "CSDBG kBroadcast -> Broadcast (fallback)" << Endl;
                 BuildBroadcastChannels(*this, stageInfo, inputIdx, inputStageInfo, outputIdx, enableSpilling, log);
                 break;
             }
@@ -1576,6 +1634,8 @@ void TKqpTasksGraph::BuildKqpStageChannels(TStageInfo& stageInfo, ui64 txId, boo
                     }
                 }
 
+                Cerr << "CSDBG kMap: isOlapSinkWithMultipleTasks=" << isOlapSinkWithMultipleTasks
+                     << " Tasks=" << stageInfo.Tasks.size() << Endl;
                 if (isOlapSinkWithMultipleTasks) {
                     // For OLAP sinks with per-shard affinity, try to use ColumnShardHashV1
                     // HashShuffle instead of Map to route each row to exactly one sink task.
@@ -1586,21 +1646,30 @@ void TKqpTasksGraph::BuildKqpStageChannels(TStageInfo& stageInfo, ui64 txId, boo
                             && !stageInfo.Meta.ShardKey->GetPartitions().empty()
                             && GetMeta().ShardsResolved) {
                         // Reuse the same ColumnShardHashV1 logic as in kBroadcast case above.
-                        const ui32 N = stageInfo.Meta.ShardKey->GetPartitions().size();
-                        TVector<ui64> resolvedShardIds;
-                        for (const auto& partition : stageInfo.Meta.ShardKey->GetPartitions()) {
-                            if (GetMeta().ShardIdToNodeId.contains(partition.ShardId)) {
-                                resolvedShardIds.push_back(partition.ShardId);
+                        // Canonical shard order = GetColumnShards() (ColumnShard bucket order),
+                        // matching CountComputeTasks / BuildInternalSinks. See detailed comment
+                        // in the kBroadcast case.
+                        TVector<ui64> orderedShardIds;
+                        if (stageInfo.Meta.ColumnTableInfoPtr
+                                && stageInfo.Meta.ColumnTableInfoPtr->Description.HasSharding()) {
+                            const auto& sharding = stageInfo.Meta.ColumnTableInfoPtr->Description.GetSharding();
+                            for (const auto& shardId : sharding.GetColumnShards()) {
+                                orderedShardIds.push_back(shardId);
+                            }
+                        } else {
+                            for (const auto& partition : stageInfo.Meta.ShardKey->GetPartitions()) {
+                                orderedShardIds.push_back(partition.ShardId);
                             }
                         }
+                        const ui32 N = orderedShardIds.size();
                         THashMap<ui64, ui32> shardToTaskIdx;
-                        for (ui32 ti = 0; ti < stageInfo.Tasks.size() && ti < resolvedShardIds.size(); ++ti) {
-                            shardToTaskIdx[resolvedShardIds[ti]] = ti;
+                        for (ui32 ti = 0; ti < stageInfo.Tasks.size() && ti < orderedShardIds.size(); ++ti) {
+                            shardToTaskIdx[orderedShardIds[ti]] = ti;
                         }
                         auto taskIndexByHash = std::make_shared<TVector<ui64>>(N, 0);
                         bool allResolved = true;
                         for (ui32 i = 0; i < N; ++i) {
-                            const ui64 shardId = stageInfo.Meta.ShardKey->GetPartitions()[i].ShardId;
+                            const ui64 shardId = orderedShardIds[i];
                             auto itTask = shardToTaskIdx.find(shardId);
                             if (itTask == shardToTaskIdx.end()) {
                                 allResolved = false;
