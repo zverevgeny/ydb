@@ -1,0 +1,36 @@
+syntax = "proto2";
+
+package Ydb.Dq.HttpEgress;
+
+option java_package = "Ydb.Dq.HttpEgress";
+
+// Settings for the HTTP egress actor (Phase 0 scaffolding).
+// These settings will be extended in Phase 1+ with full configuration.
+message TDqHttpEgressSettings {
+    // Allowed hosts for egress (empty = deny all).
+    repeated string allowed_hosts = 1;
+
+    // Denied hosts (takes precedence over allowed_hosts).
+    repeated string denied_hosts = 2;
+
+    // Maximum request body size in bytes (default 1MB).
+    optional uint64 max_request_body_size = 3 [default = 1048576];
+
+    // Maximum response body size in bytes (default 10MB).
+    optional uint64 max_response_body_size = 4 [default = 10485760];
+
+    // Maximum total headers size in bytes (default 16KB).
+    optional uint64 max_headers_size = 5 [default = 16384];
+
+    // Maximum number of in-flight requests globally (default 1000).
+    optional uint64 max_in_flight_requests = 6 [default = 1000];
+
+    // Maximum number of in-flight requests per host (default 100).
+    optional uint64 max_in_flight_requests_per_host = 7 [default = 100];
+
+    // Default timeout for requests in seconds (default 30).
+    optional uint64 default_timeout_seconds = 8 [default = 30];
+
+    // Maximum allowed timeout in seconds (default 300).
+    optional uint64 max_timeout_seconds = 9 [default = 300];
+}

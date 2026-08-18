@@ -362,4 +362,7 @@ message TFeatureFlags {
     optional bool EnableGeneratedVirtual = 309 [default = false];
     optional bool EnableTxIdInStats = 310 [default = false];
     optional bool EnableDqSourceStreamLookupJoinShuffleMode = 311 [default = false];
+    // Enables async HTTP egress from KQP/DQ compute actors.
+    // When disabled, HTTP egress requests are rejected with an error.
+    optional bool EnableHttpEgress = 312 [default = false];
 }

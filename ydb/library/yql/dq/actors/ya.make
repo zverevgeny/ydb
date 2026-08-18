@@ -18,6 +18,7 @@ END()
 RECURSE(
     common
     compute
+    http
     input_transforms
     spilling
     task_runner
