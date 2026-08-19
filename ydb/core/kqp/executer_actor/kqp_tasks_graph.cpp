@@ -731,6 +731,9 @@ void TKqpTasksGraph::FillStages() {
             }
 
             auto fillMetaFromSinkSettings = [&tx, &meta](NKikimrKqp::TKqpTableSinkSettings& settings) {
+                // For MODE_FILL (CTAS): Table.Path is the actual write target (the TEMP table created
+                // by RewriteCreateTableAs, e.g. /.tmp/sessions/.../Destination_uuid). This temp table
+                // exists when the FILL runs and has the correct shards for affinity routing.
                 meta.TablePath = settings.GetTable().GetPath();
                 if (settings.GetType() == NKikimrKqp::TKqpTableSinkSettings::MODE_DELETE) {
                     meta.ShardOperations.insert(TKeyDesc::ERowOperation::Erase);
@@ -1400,30 +1403,6 @@ void TKqpTasksGraph::BuildKqpStageChannels(TStageInfo& stageInfo, ui64 txId, boo
     }
 
     ui64 nextOriginTaskId = 0;
-    {
-        bool hasOlapSink = false;
-        for (const auto& sink : stage.GetSinks()) {
-            if (sink.HasInternalSink()
-                    && sink.GetInternalSink().GetSettings().Is<NKikimrKqp::TKqpTableSinkSettings>()) {
-                NKikimrKqp::TKqpTableSinkSettings ss;
-                if (sink.GetInternalSink().GetSettings().UnpackTo(&ss) && ss.GetIsOlap()) {
-                    hasOlapSink = true;
-                }
-            }
-        }
-        TStringBuilder inputTypes;
-        for (const auto& input : stage.GetInputs()) {
-            inputTypes << (int)input.GetTypeCase() << ",";
-        }
-        Cerr << "CSDBG stage tx=" << stageInfo.Id.TxId << " stageId=" << stageInfo.Id.StageId
-             << " tasks=" << stageInfo.Tasks.size()
-             << " sinks=" << stage.GetSinks().size()
-             << " hasOlapSink=" << hasOlapSink
-             << " inputs=" << stage.GetInputs().size()
-             << " inputTypes=[" << inputTypes << "]"
-             << " CsShardingColumns=" << stageInfo.Meta.CsShardingColumns.size()
-             << Endl;
-    }
 
     for (const auto& input : stage.GetInputs()) {
         ui32 inputIdx = input.GetInputIndex();
@@ -1504,13 +1483,6 @@ void TKqpTasksGraph::BuildKqpStageChannels(TStageInfo& stageInfo, ui64 txId, boo
                 //
                 // The params are stored on the Transform Stage (inputStageInfo) so that
                 // FillOutputDesc serializes them into the Transform Stage's task output descriptor.
-                Cerr << "CSDBG kBroadcast gate:"
-                     << " CsShardingColumns=" << stageInfo.Meta.CsShardingColumns.size()
-                     << " Tasks=" << stageInfo.Tasks.size()
-                     << " ShardKey=" << (bool)stageInfo.Meta.ShardKey
-                     << " Partitions=" << (stageInfo.Meta.ShardKey ? stageInfo.Meta.ShardKey->GetPartitions().size() : 0)
-                     << " ShardsResolved=" << GetMeta().ShardsResolved
-                     << Endl;
                 if (!stageInfo.Meta.CsShardingColumns.empty()
                         && stageInfo.Tasks.size() > 1
                         && stageInfo.Meta.ShardKey
@@ -1571,37 +1543,39 @@ void TKqpTasksGraph::BuildKqpStageChannels(TStageInfo& stageInfo, ui64 txId, boo
                     }
 
                     if (allResolved) {
-                        // Derive key column types from table schema (stored in CsShardingColumns).
+                        // Derive key column types from ColumnTableInfo schema (works for both
+                        // INSERT with TableConstInfo and CTAS without it).
+                        // Derive key column types from sink settings key columns.
+                        // For INSERT: ResolvedSinkSettings has key columns populated by resolver.
+                        // For CTAS MODE_FILL: raw sink settings have key columns from FillCreateTableAs.
                         auto keyTypes = std::make_shared<TVector<NScheme::TTypeInfo>>();
-                        if (stageInfo.Meta.ColumnTableInfoPtr) {
-                            const auto& tableConstInfo = stageInfo.Meta.TableConstInfo;
-                            for (const auto& colName : stageInfo.Meta.CsShardingColumns) {
-                                if (tableConstInfo && tableConstInfo->Columns.contains(colName)) {
-                                    keyTypes->push_back(tableConstInfo->Columns.at(colName).Type);
+                        if (stageInfo.Meta.ResolvedSinkSettings) {
+                            for (const auto& keyCol : stageInfo.Meta.ResolvedSinkSettings->GetKeyColumns()) {
+                                keyTypes->push_back(NScheme::TypeInfoFromProto(keyCol.GetTypeId(), keyCol.GetTypeInfo()));
+                            }
+                        } else {
+                            // Fallback: extract key columns from raw sink settings proto (CTAS case)
+                            for (const auto& sink : stage.GetSinks()) {
+                                if (sink.HasInternalSink()
+                                        && sink.GetInternalSink().GetSettings().Is<NKikimrKqp::TKqpTableSinkSettings>()) {
+                                    NKikimrKqp::TKqpTableSinkSettings sinkSettings;
+                                    if (sink.GetInternalSink().GetSettings().UnpackTo(&sinkSettings)) {
+                                        for (const auto& keyCol : sinkSettings.GetKeyColumns()) {
+                                            keyTypes->push_back(NScheme::TypeInfoFromProto(keyCol.GetTypeId(), keyCol.GetTypeInfo()));
+                                        }
+                                    }
                                 }
                             }
                         }
 
-                        Cerr << "CSDBG kBroadcast inner: N=" << N
-                             << " allResolved=" << allResolved
-                             << " keyTypes=" << keyTypes->size()
-                             << " CsShardingColumns=" << stageInfo.Meta.CsShardingColumns.size()
-                             << " ColumnTableInfoPtr=" << (bool)stageInfo.Meta.ColumnTableInfoPtr
-                             << " TableConstInfo=" << (bool)stageInfo.Meta.TableConstInfo
-                             << Endl;
                         if (keyTypes->size() == stageInfo.Meta.CsShardingColumns.size()) {
                             // Set ColumnShardHashV1Params on the upstream Transform Stage.
                             auto& transformParams = inputStageInfo.Meta.ColumnShardHashV1Params;
                             transformParams.SourceShardCount = N;
-                            for (ui32 i = 0; i < N; ++i) {
-                                Cerr << "CSDBG TaskIndexByHash[" << i << "]=" << (*taskIndexByHash)[i]
-                                     << " shardId=" << orderedShardIds[i] << Endl;
-                            }
                             transformParams.TaskIndexByHash = std::move(taskIndexByHash);
                             transformParams.SourceTableKeyColumnTypes = std::move(keyTypes);
 
                             // Use HashShuffle instead of Broadcast for correct per-shard routing.
-                            Cerr << "CSDBG kBroadcast -> HashShuffle(ColumnShardHashV1)" << Endl;
                             BuildHashShuffleChannels(*this, stageInfo, inputIdx, inputStageInfo, outputIdx,
                                 stageInfo.Meta.CsShardingColumns, enableSpilling, log,
                                 EHashShuffleFuncType::ColumnShardHashV1);
@@ -1610,7 +1584,6 @@ void TKqpTasksGraph::BuildKqpStageChannels(TStageInfo& stageInfo, ui64 txId, boo
                     }
                     // Fall through to Broadcast if params couldn't be resolved.
                 }
-                Cerr << "CSDBG kBroadcast -> Broadcast (fallback)" << Endl;
                 BuildBroadcastChannels(*this, stageInfo, inputIdx, inputStageInfo, outputIdx, enableSpilling, log);
                 break;
             }
@@ -1634,8 +1607,6 @@ void TKqpTasksGraph::BuildKqpStageChannels(TStageInfo& stageInfo, ui64 txId, boo
                     }
                 }
 
-                Cerr << "CSDBG kMap: isOlapSinkWithMultipleTasks=" << isOlapSinkWithMultipleTasks
-                     << " Tasks=" << stageInfo.Tasks.size() << Endl;
                 if (isOlapSinkWithMultipleTasks) {
                     // For OLAP sinks with per-shard affinity, try to use ColumnShardHashV1
                     // HashShuffle instead of Map to route each row to exactly one sink task.
@@ -1678,12 +1649,23 @@ void TKqpTasksGraph::BuildKqpStageChannels(TStageInfo& stageInfo, ui64 txId, boo
                             (*taskIndexByHash)[i] = itTask->second;
                         }
                         if (allResolved) {
+                            // Derive key column types from sink settings key columns.
                             auto keyTypes = std::make_shared<TVector<NScheme::TTypeInfo>>();
-                            if (stageInfo.Meta.ColumnTableInfoPtr) {
-                                const auto& tableConstInfo = stageInfo.Meta.TableConstInfo;
-                                for (const auto& colName : stageInfo.Meta.CsShardingColumns) {
-                                    if (tableConstInfo && tableConstInfo->Columns.contains(colName)) {
-                                        keyTypes->push_back(tableConstInfo->Columns.at(colName).Type);
+                            if (stageInfo.Meta.ResolvedSinkSettings) {
+                                for (const auto& keyCol : stageInfo.Meta.ResolvedSinkSettings->GetKeyColumns()) {
+                                    keyTypes->push_back(NScheme::TypeInfoFromProto(keyCol.GetTypeId(), keyCol.GetTypeInfo()));
+                                }
+                            } else {
+                                // Fallback: extract key columns from raw sink settings proto (CTAS case)
+                                for (const auto& sink : stage.GetSinks()) {
+                                    if (sink.HasInternalSink()
+                                            && sink.GetInternalSink().GetSettings().Is<NKikimrKqp::TKqpTableSinkSettings>()) {
+                                        NKikimrKqp::TKqpTableSinkSettings sinkSettings;
+                                        if (sink.GetInternalSink().GetSettings().UnpackTo(&sinkSettings)) {
+                                            for (const auto& keyCol : sinkSettings.GetKeyColumns()) {
+                                                keyTypes->push_back(NScheme::TypeInfoFromProto(keyCol.GetTypeId(), keyCol.GetTypeInfo()));
+                                            }
+                                        }
                                     }
                                 }
                             }
@@ -3596,11 +3578,12 @@ void TKqpTasksGraph::BuildInternalSinks(const NKqpProto::TKqpSink& sink, const T
         // When TargetShardIds is populated, the WriteActor discards rows destined for
         // shards not in the list (which are handled by other tasks in case A, or are an
         // error in case B — but case B uses all shards so nothing is discarded).
-        if (settings.GetIsOlap()) {
+        // Only assign TargetShardIds when there are multiple per-shard tasks.
+        // For single-task paths, skip TargetShardIds so the single WriteActor
+        // handles all shards without filtering.
+        if (settings.GetIsOlap() && stageInfo.Tasks.size() > 1) {
 
             // Collect all target shards from ColumnTableInfo (for OLAP) or ShardKey (for DataShards).
-            // Unlike before, we collect ALL shards, not just those in ShardIdToNodeId,
-            // because CountComputeTasks now creates per-shard tasks regardless of node mapping.
             TVector<ui64> resolvedShardIds;
             if (stageInfo.Meta.ColumnTableInfoPtr
                     && stageInfo.Meta.ColumnTableInfoPtr->Description.HasSharding()) {
@@ -4438,9 +4421,10 @@ void TKqpTasksGraph::CountComputeTasks(TStageInfo& stageInfo, const ui32 nodesCo
     //       single-task path (correctness preserved, node affinity benefit deferred).
     {
         bool isCsWriteAffinitySink = false;
-        // Check for OLAP sink regardless of ShardsResolved status.
-        // Map connections to OLAP sinks will be converted to Broadcast in BuildKqpStageChannels
-        // to avoid task count mismatch (Map requires originTasks.size() == targetTasks.size()).
+        // Check for OLAP sink (including CTAS MODE_FILL). Per-shard tasks are created
+        // for each shard of the target table, pinned to the node hosting that shard.
+        // CTAS temp table shards are now added to ShardIdToNodeId via kqp_executer_impl.h,
+        // so per-shard routing works correctly for both INSERT and CTAS.
         for (const auto& sink : stage.GetSinks()) {
             if (sink.HasInternalSink()
                     && sink.GetInternalSink().GetSettings().Is<NKikimrKqp::TKqpTableSinkSettings>()) {
