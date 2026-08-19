@@ -1,13 +1,11 @@
 # ColumnShard Write Node Affinity
 
-**PRAGMA**: `PRAGMA ydb.EnableCsWriteAffinity` (по умолчанию **включено**).
-Явно выключить: `PRAGMA ydb.EnableCsWriteAffinity = "false";`
 
 ---
 
-## 1. Текущее состояние в origin/main (проблема)
+## 1. Формулировка проблемы.
 
-При записи в колонную таблицу (CTAS / FILL / INSERT) создаётся **один** WriteActor
+При записи в колонную таблицу при CTAS / FILL / INSERT) создаётся **один** WriteActor
 на весь Sink Stage:
 
 ```
@@ -28,7 +26,108 @@ TShardedWriteController
 3. **Память** — все per-shard буферы сосредоточены в одном месте
 4. **Нет affinity** — планировщик не учитывает расположение шардов
 
+### 1.1 Текущая(origin/main) реализация CTAS
+
+#### 1.1.1 Декомпозиция CTAS на стейтменты
+
+С `EnablePerStatementQueryExecution=true` CTAS компилируется как три независимых стейтмента:
+
+1. **CREATE TABLE** — создаёт temp-таблицу `/.tmp/sessions/.../Destination_uuid`
+2. **FILL** — записывает данные в temp-таблицу (стейтмент с sink mode `MODE_FILL`)
+3. **MOVE** — атомарно переименовывает temp-таблицу в `/Root/Destination`
+
+Именно стейтмент **FILL** является объектом оптимизации.
+
+#### 1.1.2 Оптимизатор: [`BuildFillTableEffect`](ydb/core/kqp/opt/kqp_opt_effects.cpp:162)
+
+`BuildFillTableEffect(node, ctx, effect, order)` — сигнатура без `TKqpOptimizeContext`.
+
+Для Union-input (типичный CTAS с источником из другой таблицы) строится **один** `TDqStage`:
+- входной канал: `TDqCnMap` из upstream stage
+- программа: `ToFlow(row)`
+- выход: `TDqSink` (sink внутри того же stage)
+
+Sink settings (`TKqpTableSinkSettings`):
+- `Type = MODE_FILL`, `Table.Path` = путь temp-таблицы назначения
+- `InputColumns` = список имён колонок из плана
+- `InconsistentWrite = true`, `StreamWrite = true`
+- `OriginalPath` (путь destination) хранится как атом в settings самого stage — в proto sink settings не передаётся
+
+#### 1.1.3 Компилятор: [`FillCreateTableAs`](ydb/core/kqp/query_compiler/kqp_query_compiler.cpp:2456)
+
+Заполняет proto `TKqpTableSinkSettings`:
+- `MODE_FILL`, `Table.Path`, `InputColumns`
+- `Columns`, `KeyColumns`, `WriteIndexes` не заполняются — добавляются table resolver'ом во время выполнения
+
+#### 1.1.4 Table Resolver: [`kqp_table_resolver.cpp`](ydb/core/kqp/executer_actor/kqp_table_resolver.cpp)
+
+**Проход 1 — `HandleResolveNames` (Navigate by path)**:
+- Навигирует temp-таблицу по `settings.GetTable().GetPath()`
+- `AFL_ENSURE(settings.GetType() == MODE_FILL)` — обрабатывает только FILL
+- Заполняет `stageMeta.ResolvedSinkSettings`: `TableId`, `IsOlap`, `KeyColumns`, `Columns`, `WriteIndexes`
+- Создаёт `stageMeta.ShardKey = ExtractKey(tableId, keyTypes, Update)`
+
+**Проход 2 — `HandleResolveKeys` (Navigate by TableId)**:
+- `stageMeta.ColumnTableInfoPtr = entry.ColumnTableInfo`
+- Резолвинг `ShardKey->Partitioning` через `TEvResolveKeySetResult`
+
+#### 1.1.5 Executer: [`kqp_executer_impl.h`](ydb/core/kqp/executer_actor/kqp_executer_impl.h)
+
+Executer собирает `shardIds` для резолвинга нод только по стадиям с `TableOps` (scan-источники). Для стадий без TableOps (в т.ч. FILL-sink) — ветка `else` с TODO-комментариями, без кода. Шарды temp-таблицы в `shardIds` не попадают. Если источник данных не читает никаких таблиц, `shardIds` пуст, и `TasksGraph.ResolveShards({})` вызывается сразу с пустой картой — `ShardIdToNodeId` пуст.
+
+#### 1.1.6 `CountComputeTasks`: [`kqp_tasks_graph.cpp:4002`](ydb/core/kqp/executer_actor/kqp_tasks_graph.cpp:4002)
+
+Для sink-стейджа FILL входной канал — `TDqCnMap`:
+- `inputTypeCase == kMap` → `stageType = COPY`, `partitionsCount = upstream_tasks_count`
+- Upstream имеет 1 задачу → `partitionsCount = 1`
+- Результат: **1 задача** FILL, выполняется на executer-ноде
+
+#### 1.1.7 `BuildKqpStageChannels` (kMap)
+
+`TDqCnMap` обрабатывается как стандартный **Map-канал** 1:1 между upstream-задачей и единственной задачей FILL.
+
+#### 1.1.8 `BuildInternalSinks`: [`kqp_tasks_graph.cpp:3327`](ydb/core/kqp/executer_actor/kqp_tasks_graph.cpp:3327)
+
+Берёт `ResolvedSinkSettings`, вызывает `FillKqpTableSinkSettings`, пакует в `output.SinkSettings`:
+```cpp
+output.SinkSettings.ConstructInPlace();
+output.SinkSettings->PackFrom(settings);
+```
+Поля `TargetShardIds` в proto и в коде нет.
+
+#### 1.1.9 WriteActor: [`kqp_write_table.cpp`](ydb/core/kqp/runtime/kqp_write_table.cpp)
+
+`TShardedWriteController::ShardAndFlushBatch`:
+```cpp
+void ShardAndFlushBatch(TRecordBatchPtr&& unshardedBatch, bool force) {
+    for (auto [shardId, shardBatch] : Sharding->SplitByShardsToArrowBatches(...)) {
+        ShardIds.insert(shardId);
+        auto& unpreparedBatch = UnpreparedBatches[shardId];
+        ...
+        FlushUnpreparedBatch(shardId, unpreparedBatch, force);
+    }
+}
+```
+Единственный WriteActor шардирует все строки и отправляет каждый батч в соответствующий ColumnShard по сети.
+
+#### 1.1.10 Итоговая схема в origin/main
+
+```
+Upstream ComputeActor
+    ↓ TDqCnMap (1:1, COPY)
+TKqpDirectWriteActor (1 задача, executer-нода)
+    └── TShardedWriteController
+            ├── Hash(PK) → CS[0]  (сеть)
+            ├── Hash(PK) → CS[1]  (сеть)
+            └── Hash(PK) → CS[N]  (сеть)
+```
+
 ---
+
+### 1.2 Другие (не CTAS) сценарии записи
+
+out of scope текущего документа
+
 
 ## 2. Целевая картина
 
@@ -53,7 +152,7 @@ ComputeActor (Stage N)                 ComputeActor (Stage N)
 ### 2.2 Ключевые требования
 
 1. **Точный routing**: каждая задача получает строки **только своих** шардов (тех, что
-   в её `TargetShardIds`). Broadcast с фильтрацией в WriteActor — **неправильный** подход
+   в её `TargetShardIds`). Фильтрация в WriteActor — **неправильный** подход
    (M× сетевой трафик и избыточная работа). При Per-Node разбивке одна задача обслуживает
    все шарды данной ноды — их может быть несколько.
 
@@ -83,7 +182,11 @@ ComputeActor (Stage N)                 ComputeActor (Stage N)
 Поддерживаются два варианта. Оба требуют точного routing'а: строки попадают
 **только в задачу-владельца** нужного шарда.
 
-**Вариант A: Per-Shard** (K = N, текущая реализация для INSERT)
+**Вариант A: Per-Shard** K = N
+
+**PRAGMA**: `PRAGMA ydb.EnableCsWriteAffinity` (по умолчанию **включено**).
+
+
 ```
 StageShards[i] = {sᵢ}            — ровно один шард на задачу
 StageNode[i]   = P(sᵢ)           — нода шарда sᵢ
