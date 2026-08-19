@@ -211,179 +211,195 @@ TaskIndexByHash[bucket] = j                — bucket → нода шарда s�
 
 ### 3.1 Что реализовано
 
-| Этап | Описание | Статус | Файлы |
-|------|----------|--------|-------|
-| **1** | PRAGMA `EnableCsWriteAffinity` + proto-поле `TKqpPhyTx.EnableCsWriteAffinity` | ✅ | [`yql_kikimr_settings.h:127`](ydb/core/kqp/provider/yql_kikimr_settings.h:127), [`kqp_physical.proto`](ydb/core/protos/kqp_physical.proto:745) |
-| **2** | Отдельный Sink Stage (Transform→Sink через `TDqCnBroadcast`) | ✅ | [`kqp_opt_effects.cpp:162`](ydb/core/kqp/opt/kqp_opt_effects.cpp:162) |
-| **3** | Поля `TargetShardIds = 30`, `ExpectedNodeId = 31`, `CtasDestinationPath = 32` в proto | ✅ | [`kqp.proto:929`](ydb/core/protos/kqp.proto:929) |
-| **4** | Table resolver запрашивает `ColumnTableInfo` целевой таблицы для OLAP sink-стейджей | ✅ | [`kqp_table_resolver.cpp`](ydb/core/kqp/executer_actor/kqp_table_resolver.cpp) |
-| **5** | `CsShardingColumns` и `ColumnTableInfoPtr` sink-стейджа заполняются из целевой таблицы | ✅ | [`kqp_table_resolver.cpp:280`](ydb/core/kqp/executer_actor/kqp_table_resolver.cpp) |
-| **6** | Per-shard задачи для non-CTAS OLAP сinks (`ResolvedSinkSettings != null`) | ✅ | [`kqp_tasks_graph.cpp:4473`](ydb/core/kqp/executer_actor/kqp_tasks_graph.cpp) |
-| **7** | `TargetShardIds` назначаются только для multi-task стейджей | ✅ | [`kqp_tasks_graph.cpp:3628`](ydb/core/kqp/executer_actor/kqp_tasks_graph.cpp) |
-| **8** | `ColumnShardHashV1` routing для non-CTAS OLAP (kBroadcast/kMap → HashShuffle) | ✅ | [`kqp_tasks_graph.cpp:1492`](ydb/core/kqp/executer_actor/kqp_tasks_graph.cpp) |
-| **8'** | CTAS FILL: 1 задача, Broadcast → одна задача пишет все шарды (без фильтрации) | 🔶 workaround | [`kqp_tasks_graph.cpp:4473`](ydb/core/kqp/executer_actor/kqp_tasks_graph.cpp) |
-| **9** | Планировщик `AssignTasksToNodes()` использует `ExpectedNodeId` | ✅ (без изменений) | [`kqp_planner.cpp:346`](ydb/core/kqp/executer_actor/kqp_planner.cpp) |
-| **10** | Тесты | ✅ | [`kqp_query_ut.cpp`](ydb/core/kqp/ut/query/kqp_query_ut.cpp), [`kqp_write_affinity_ut.cpp`](ydb/core/kqp/ut/query/kqp_write_affinity_ut.cpp) |
+| № | Описание | Статус | Файл |
+|---|----------|--------|------|
+| 1 | PRAGMA `EnableCsWriteAffinity` → флаг в `TKqpPhyTx.EnableCsWriteAffinity` (proto) | ✅ | [`yql_kikimr_settings.h`](ydb/core/kqp/provider/yql_kikimr_settings.h), [`kqp_physical.proto`](ydb/core/protos/kqp_physical.proto) |
+| 2 | `BuildFillTableEffect`: при `enableCsWriteAffinity` строятся **два** stage — Transform + отдельный Sink, соединённые `TDqCnBroadcast` | ✅ | [`kqp_opt_effects.cpp:238`](ydb/core/kqp/opt/kqp_opt_effects.cpp:238) |
+| 3 | Proto-поля `TargetShardIds = 30`, `ExpectedNodeId = 31`, `CtasDestinationPath = 32` в `TKqpTableSinkSettings` | ✅ | [`kqp.proto`](ydb/core/protos/kqp.proto) |
+| 4 | `FillCreateTableAs`: сохраняет `CtasDestinationPath` (путь destination) в `TKqpTableSinkSettings` | ✅ | [`kqp_query_compiler.cpp:2456`](ydb/core/kqp/query_compiler/kqp_query_compiler.cpp:2456) |
+| 5 | Table resolver `HandleResolveNames`: принимает OLAP сinks (не только MODE_FILL); `ResolvedSinkSettings` заполняется для всех типов | ✅ | [`kqp_table_resolver.cpp`](ydb/core/kqp/executer_actor/kqp_table_resolver.cpp) |
+| 6 | Table resolver `HandleResolveKeys`: при `EnableCsWriteAffinity` + OLAP sink заполняет `stageMeta.CsShardingColumns` и `ShardKey->Partitioning` из `ColumnTableInfo.GetColumnShards()` | ✅ | [`kqp_table_resolver.cpp:303`](ydb/core/kqp/executer_actor/kqp_table_resolver.cpp:303) |
+| 7 | `kqp_executer_impl.h`: для FILL-sink стадий с `EnableCsWriteAffinity` добавляет шарды temp-таблицы в `shardIds` → они попадают в `ShardIdToNodeId` | ✅ | [`kqp_executer_impl.h:319`](ydb/core/kqp/executer_actor/kqp_executer_impl.h:319) |
+| 8 | `CountComputeTasks`: при наличии OLAP sink (`GetIsOlap()`) создаёт per-shard задачи из `ColumnTableInfoPtr->GetColumnShards()`, пиннит к ноде шарда через `ShardIdToNodeId` | ✅ | [`kqp_tasks_graph.cpp:4408`](ydb/core/kqp/executer_actor/kqp_tasks_graph.cpp:4408) |
+| 9 | `BuildKqpStageChannels` (kBroadcast): при `CsShardingColumns` + N>1 задач строит `ColumnShardHashV1` HashShuffle вместо Broadcast | ✅ | [`kqp_tasks_graph.cpp:1472`](ydb/core/kqp/executer_actor/kqp_tasks_graph.cpp:1472) |
+| 10 | `BuildKqpStageChannels` (kMap): при OLAP sink с N>1 задачами аналогично заменяет Map на `ColumnShardHashV1` HashShuffle | ✅ | [`kqp_tasks_graph.cpp:1590`](ydb/core/kqp/executer_actor/kqp_tasks_graph.cpp:1590) |
+| 11 | `BuildInternalSinks`: при `IsOlap` + N>1 задач назначает `TargetShardIds = {shard_i}` задаче i по индексу в `GetColumnShards()` | ✅ | [`kqp_tasks_graph.cpp:3545`](ydb/core/kqp/executer_actor/kqp_tasks_graph.cpp:3545) |
+| 12 | `AssignTasksToNodes`: планировщик использует `ExpectedNodeId` для пиннинга задач к нодам шардов | ✅ | [`kqp_planner.cpp`](ydb/core/kqp/executer_actor/kqp_planner.cpp) |
+| 13 | `ShardAndFlushBatch`: `AFL_VERIFY(TargetShardIds->contains(shardId))` — строгая валидация routing'а | ✅ | [`kqp_write_table.cpp:522`](ydb/core/kqp/runtime/kqp_write_table.cpp:522) |
+| 14 | Тесты: `KqpWriteAffinity::*`, `KqpQuery::CTAS_WriteAffinity_Twin*`, `*CreateAsSelect*`, olap/operations | ✅ | [`kqp_write_affinity_ut.cpp`](ydb/core/kqp/ut/query/kqp_write_affinity_ut.cpp) |
 
-### 3.2 Результаты тестов
+### 3.2 Итоговая схема в ветке (CTAS с `EnableCsWriteAffinity`)
 
-```bash
-KqpQuery::CTAS_WriteAffinity_Twin*   — 2/2  GOOD
-KqpWriteAffinity::*                  — 5/5  GOOD
-*CreateAsSelect*                     — 17/17 GOOD
-ydb/core/kqp/ut/olap/operations/     — 13/13 GOOD
 ```
-
-### 3.3 Архитектура CTAS в ветке (workaround)
-
-С `EnablePerStatementQueryExecution=true`, CTAS компилируется как 3 отдельных стейтмента:
-1. **CREATE TABLE** → создаёт temp-таблицу `/.tmp/sessions/.../Destination_uuid`
-2. **FILL** → записывает данные в temp-таблицу (1 задача, все шарды)
-3. **MOVE** → переименовывает temp-таблицу в `/Root/Destination`
-
-Sink-стейдж FILL имеет `ResolvedSinkSettings != null` (temp-таблица резолвится), но создаётся
-**одна задача** (не per-shard), поскольку `ColumnTableInfoPtr` для CTAS FILL на момент
-`CountComputeTasks` может быть нечётко привязана к нодам шардов. `TargetShardIds` для
-одной задачи не назначаются — задача пишет все шарды сразу.
-
-Текущее состояние `ShardAndFlushBatch` в [`kqp_write_table.cpp:519`](ydb/core/kqp/runtime/kqp_write_table.cpp:519):
-```cpp
-// workaround: continue вместо AFL_VERIFY для одной задачи
-if (TargetShardIds.has_value() && !TargetShardIds->contains(shardId)) {
-    continue;  // временно; должен быть AFL_VERIFY при правильном routing
-}
+Upstream ComputeActor
+    ↓ TDqCnMap (1:1)
+Transform Stage (1 задача, любая нода)
+    ↓ ColumnShardHashV1 HashShuffle (hash(PK) → task i)
+Sink Stage (N задач, по одной на шард)
+    WriteActor[0] на Node(CS[0]) → CS[0]  (local)
+    WriteActor[1] на Node(CS[1]) → CS[1]  (local)
+    ...
+    WriteActor[N] на Node(CS[N]) → CS[N]  (local)
 ```
 
 ---
 
 ## 4. Список доработок
 
-Реализация разбита на два этапа:
-- **Этап 1 (Per-Shard)**: каждая задача обслуживает ровно один шард, пинится к его ноде.
-  Задачи определены ниже.
-- **Этап 2 (Per-Node)**: задачи группируются по нодам (несколько шардов на задачу),
-  снижает количество акторов с N до M. Задачи будут уточнены позже.
+### 4.1 **Вариант A: Per-Shard** K = N
+
+#### Статус: бо́льшая часть реализована. Остаются уточнения и cleanup.
 
 ---
 
-### Этап 1: Per-Shard routing
+##### 4.1.1 [БЛОКЕР] Ретрай Navigate при `ColumnTableInfoPtr == null` — баг: CRASH
 
-#### Задача 1.1: Per-shard задачи для CTAS через temp-таблицу
+**Когда `ColumnTableInfoPtr == null`:**
 
-**Статус**: ⬜ Не реализовано
-**Проблема**: Для CTAS FILL создаётся 1 задача вместо N (по числу шардов temp-таблицы),
-т.к. шарды temp-таблицы могут не быть в `ShardIdToNodeId` на момент `CountComputeTasks`.
+`ResolveKeys()` (второй вызов после `HandleResolveNames`) одновременно посылает два запроса в SchemeCache:
+- `TEvNavigateKeySet` by TableId → ответ `HandleResolveKeys(TEvNavigateKeySetResult)` — ставит `ColumnTableInfoPtr + CsShardingColumns + ShardKey->Partitioning`
+- `TEvResolveKeySet` → ответ `HandleResolveKeys(TEvResolveKeySetResult)` — перезаписывает `ShardKey`
 
-**Что нужно сделать**:
-1. В [`kqp_executer_impl.h`](ydb/core/kqp/executer_actor/kqp_executer_impl.h) добавить
-   шарды MODE_FILL temp-таблицы в `shardIds` для резолвинга нод (по аналогии с строками 319–338).
-2. В [`CountComputeTasks`](ydb/core/kqp/executer_actor/kqp_tasks_graph.cpp:4473) разрешить
-   per-shard задачи для CTAS FILL (`ResolvedSinkSettings != null`), когда шарды temp-таблицы
-   присутствуют в `ShardIdToNodeId`.
-3. В [`BuildInternalSinks`](ydb/core/kqp/executer_actor/kqp_tasks_graph.cpp:3628) назначать
-   `TargetShardIds = {sᵢ}` для каждой задачи.
-4. Убрать workaround: вернуть `AFL_VERIFY` вместо `continue` в
-   [`ShardAndFlushBatch`](ydb/core/kqp/runtime/kqp_write_table.cpp:519).
+Оба ответа обрабатываются в `ResolveKeysState` и могут прийти в **любом порядке**. Если Navigate by TableId вернул `entry.ColumnTableInfo == nullptr` (например, SchemeCache ещё не обновился до ColumnTableInfo для только что созданной temp-таблицы), то `ColumnTableInfoPtr` остаётся null, `CsShardingColumns` остаётся пустым.
 
----
+**Что происходит при `ColumnTableInfoPtr == null`:**
 
-#### Задача 1.2: ColumnShardHashV1 routing для CTAS Transform→Sink
+| Место | Ветка | Результат |
+|-------|-------|-----------|
+| [`CountComputeTasks`](ydb/core/kqp/executer_actor/kqp_tasks_graph.cpp:4447) | `ColumnTableInfoPtr == null`, `ShardKey` есть → `ShardKey->GetPartitions()` | N задач создаётся |
+| [`BuildKqpStageChannels`](ydb/core/kqp/executer_actor/kqp_tasks_graph.cpp:1486) | `CsShardingColumns.empty()` → условие fail | Остаётся **Broadcast** (не HashShuffle!) |
+| [`BuildInternalSinks`](ydb/core/kqp/executer_actor/kqp_tasks_graph.cpp:3588) | `ColumnTableInfoPtr == null`, `ShardKey` → `ShardKey->GetPartitions()` | `TargetShardIds = {shard_i}` по порядку ShardKey |
+| WriteActor [`ShardAndFlushBatch`](ydb/core/kqp/runtime/kqp_write_table.cpp:522) | Broadcast → все строки → шардифицирует → `AFL_VERIFY(TargetShardIds->contains(shardId))` | **CRASH** для строк чужих шардов |
 
-**Статус**: ⬜ Не реализовано (зависит от 1.1)
-**Проблема**: После появления N per-shard задач для CTAS нужно настроить `ColumnShardHashV1`
-HashShuffle на канале Transform→Sink, чтобы каждая строка попадала ровно в одну задачу.
+**Итог**: `ColumnTableInfoPtr == null` ведёт к **crash** (`AFL_VERIFY` в WriteActor) из-за несоответствия: N задач + Broadcast + `TargetShardIds`. Broadcast шлёт все строки во все задачи, но каждая задача ожидает только «свои» строки.
 
-**Что нужно сделать**:
-1. В [`BuildKqpStageChannels`](ydb/core/kqp/executer_actor/kqp_tasks_graph.cpp:1492) для
-   CTAS FILL sink-стейджа с N>1 задачами: заменить `TDqCnBroadcast` на `ColumnShardHashV1`
-   HashShuffle (как уже сделано для INSERT).
-2. Убедиться, что `TaskIndexByHash[bucket_i] = i` совпадает с `TargetShardIds[i]`
-   (порядок `GetColumnShards()` одинаков в обоих местах).
+**Дополнительно**: даже если бы `AFL_VERIFY` не было — порядок `ShardKey->GetPartitions()` из `TEvResolveKeySetResult` **не гарантирован** для OLAP таблиц, что может привести к неверному routing'у.
 
----
+**Что нужно сделать:**
 
-#### Задача 1.3: CTAS без EnablePerStatementQueryExecution
+Navigate by TableId для существующей колонной таблицы (`entry.Kind == KindColumnTable`) обязан возвращать заполненный `entry.ColumnTableInfo` — таблица создана, схема должна быть доступна. Если он `nullptr` — SchemeCache ещё не проgatewayed создание таблицы (гонка между CREATE TABLE и Navigate).
 
-**Статус**: ⬜ Не исследовано
-**Проблема**: Без `EnablePerStatementQueryExecution` CTAS может компилироваться иначе
-(без temp-таблицы). Нужно исследовать, доступны ли шарды целевой таблицы через
-`ShardIdToNodeId` в этом сценарии, и применить аналогичный подход.
+**Решение: ретрай Navigate в `HandleResolveKeys`**
 
----
+`TKqpTableResolver` — актор в `ResolveKeysState`, который ждёт двух независимых ответов:
+- `TEvNavigateKeySetResult` (Navigate by TableId) → флаг `NavigationFinished`
+- `TEvResolveKeySetResult` (ResolveKeySet) → флаг `ResolvingFinished`
 
-#### Задача 1.4: Удалить временные workaround'ы
+`TryFinish()` вызывается только когда оба флага выставлены. Если Navigate вернул `ColumnTableInfo == nullptr` для OLAP sink — не выставлять `NavigationFinished`, а послать новый `TEvNavigateKeySet` в SchemeCache и дождаться повторного ответа. Актор остаётся в `ResolveKeysState` и продолжит принимать оба типа ответов.
 
-**Статус**: ⬜ Выполнять после 1.1–1.2
-**Что нужно сделать**:
-- Удалить поле `CtasDestinationPath = 32` из [`kqp.proto`](ydb/core/protos/kqp.proto:929)
-  если оно больше не нужно.
-- Удалить условие `stageInfo.Meta.ResolvedSinkSettings` из `CountComputeTasks` (перейти
-  к явной проверке типа операции).
-
----
-
-#### Задача 1.5: Бенчмарк и тесты корректности
-
-**Статус**: ⬜ Не реализовано
-**Что нужно сделать**:
-- Тест: каждый WriteActor получает строки только своих шардов (нет пересечений).
-- Тест: split/merge шардов во время записи — корректный fallback.
-- Бенчмарк: трафик affinity vs baseline (ожидается снижение в N раз).
-
----
-
-### Этап 2: Per-Node routing
-
-> Задачи для этапа 2 будут уточнены после завершения этапа 1.
-
-Общая идея: сгруппировать шарды по нодам (`P: Shard → Node`), создать M=|{Node}| задач
-вместо N шардов. Каждая задача обслуживает `{s | P(s) = Nodeⱼ}` шардов.
-`TargetShardIds` содержит несколько шардов. `ColumnShardHashV1` routing строится
-как `TaskIndexByHash[bucket] = j` (нода, а не шард).
-
----
-
-## 5. Ключевые файлы
-
-| Файл | Роль |
-|------|------|
-| [`yql_kikimr_settings.h:127`](ydb/core/kqp/provider/yql_kikimr_settings.h:127) | Настройка `EnableCsWriteAffinity` |
-| [`kqp_physical.proto:745`](ydb/core/protos/kqp_physical.proto:745) | Поле `TKqpPhyTx.EnableCsWriteAffinity` |
-| [`kqp.proto:929`](ydb/core/protos/kqp.proto:929) | `TargetShardIds`, `ExpectedNodeId`, `CtasDestinationPath` |
-| [`kqp_query_compiler.cpp:2456`](ydb/core/kqp/query_compiler/kqp_query_compiler.cpp:2456) | `FillCreateTableAs` — сохраняет `CtasDestinationPath` |
-| [`kqp_opt_effects.cpp:162`](ydb/core/kqp/opt/kqp_opt_effects.cpp:162) | `BuildFillTableEffect()` — разделение stage, `TDqCnBroadcast` |
-| [`kqp_table_resolver.cpp`](ydb/core/kqp/executer_actor/kqp_table_resolver.cpp) | Резолвинг целевой таблицы, `CsShardingColumns`, `ColumnTableInfoPtr` |
-| [`kqp_tasks_graph.cpp:4473`](ydb/core/kqp/executer_actor/kqp_tasks_graph.cpp) | `CountComputeTasks` — per-shard задачи для non-CTAS |
-| [`kqp_tasks_graph.cpp:3628`](ydb/core/kqp/executer_actor/kqp_tasks_graph.cpp) | `BuildInternalSinks` — `TargetShardIds` для multi-task |
-| [`kqp_tasks_graph.cpp:1492`](ydb/core/kqp/executer_actor/kqp_tasks_graph.cpp) | `BuildKqpStageChannels` — `ColumnShardHashV1` HashShuffle |
-| [`kqp_planner.cpp:346`](ydb/core/kqp/executer_actor/kqp_planner.cpp) | `AssignTasksToNodes` — планирование с affinity |
-| [`kqp_write_table.cpp:519`](ydb/core/kqp/runtime/kqp_write_table.cpp) | `ShardAndFlushBatch` — фильтрация/валидация шардов |
-| [`dq_output_consumer.cpp:136`](ydb/library/yql/dq/runtime/dq_output_consumer.cpp) | `TColumnShardHashV1` — DQ hash routing |
-| [`calcer.cpp:106`](ydb/core/formats/arrow/hash/calcer.cpp) | `TXX64::Execute` — ColumnShard hash (совместим с DQ) |
-
----
-
-## 6. Тесты
-
-```bash
-# TWIN-тест (обе ветки прагмы)
-./ya make --build relwithdebinfo -tA ydb/core/kqp/ut/query -F 'KqpQuery::CTAS_WriteAffinity_Twin*'
-
-# Affinity suite
-./ya make --build relwithdebinfo -tA ydb/core/kqp/ut/query -F 'KqpWriteAffinity::*'
-
-# CreateAsSelect регрессия
-./ya make --build relwithdebinfo -tA ydb/core/kqp/ut/query -F '*CreateAsSelect*'
-
-# OLAP write интеграция
-./ya make --build relwithdebinfo -tA ydb/core/kqp/ut/olap/operations
+```cpp
+// В HandleResolveKeys (TEvNavigateKeySetResult):
+bool needRetry = false;
+for (auto stageId : stageIds) {
+    auto& stageMeta = TasksGraph.GetStageInfo(stageId).Meta;
+    stageMeta.ColumnTableInfoPtr = entry.ColumnTableInfo;
+    if (!entry.ColumnTableInfo
+            && stageMeta.ResolvedSinkSettings
+            && stageMeta.ResolvedSinkSettings->GetIsOlap()) {
+        needRetry = true;
+        TableRequestIds[entry.TableId].emplace_back(stageId);
+    }
+    ...
+}
+if (needRetry) {
+    // Переотправить Navigate by TableId, не выставляя NavigationFinished
+    auto requestNavigate = ...;
+    for (auto& [tableId, stageIds] : TableRequestIds) { ... }
+    Send(MakeSchemeCacheID(), new TEvTxProxySchemeCache::TEvNavigateKeySet(...));
+    return; // NavigationFinished остаётся false
+}
+NavigationFinished = true;
+TryFinish();
 ```
 
-| Тест | Что проверяет |
-|------|---------------|
-| `CTAS_WriteAffinity_Twin` | 3 stage без / 4 stage с прагмой; Broadcast+Sink в плане; идентичность данных |
-| `KqpWriteAffinity::CTAS_WriteAffinity_LargeData` | CTAS 100 строк, несколько flush'ей |
-| `KqpWriteAffinity::CTAS_WriteAffinity_MultiNode` | Кластер из 3 нод; per-shard задачи |
-| `KqpWriteAffinity::CTAS_WriteAffinity_JoinSource` | CTAS с JOIN |
-| `KqpWriteAffinity::CTAS_WriteAffinity_EmptySource` | Пустой источник |
-| `KqpWriteAffinity::CTAS_WriteAffinity_CompositeKey` | Composite primary key |
+**Ограничения**:
+- Нужен счётчик ретраев + таймаут — если SchemeCache никогда не вернёт `ColumnTableInfo`, запрос должен завершиться с ошибкой через N попыток
+- `TableRequestIds` нужно восстановить перед ретраем (он был `erase`-нут при первой обработке)
+
+Дополнительно: убрать fallback-ветку `else if (ShardKey)` в `CountComputeTasks` и `BuildInternalSinks` для OLAP sinks — она не должна достигаться после надёжного получения `ColumnTableInfo`.
+
+**Статус**: ⬜ Не реализовано
+
+---
+
+##### 4.1.2 [БЛОКЕР] Починить write stats — двойной счёт при per-shard задачах
+
+**Статус**: ⬜ Workaround, требует нормального фикса
+
+В [`kqp_cost_ut.cpp`](ydb/core/kqp/ut/cost/kqp_cost_ut.cpp) строгие ассерты на количество строк/байт в write stats заменены на `UNIT_ASSERT_GE + rows % N == 0`. Причина: при per-shard задачах каждая задача сообщает свою статистику, итого rows умножается на число задач. Это **побочный эффект**, а не ожидаемое поведение.
+
+**Действия**:
+- Выяснить, где агрегируется write stats (executer или session actor)
+- Дедуплицировать/суммировать корректно: итоговое число строк должно быть равно реальному числу записанных строк, независимо от числа задач
+- Вернуть строгие ассерты в тестах
+
+---
+
+##### 4.1.3 [БЛОКЕР] Разобраться с изменением в `kqp_session_actor.cpp`
+
+**Статус**: ⬜ Требует проверки
+
+В [`kqp_session_actor.cpp:1147`](ydb/core/kqp/session_actor/kqp_session_actor.cpp:1147) добавлено:
+```cpp
+if (stageInfo.Meta.ColumnTableInfoPtr && ...) {
+    for (const auto& shardId : ...GetColumnShards())
+        shardIds.insert(shardId);
+}
+```
+Это добавление OLAP shard'ов в `shardIds` в контексте session actor'а (вероятно, для `TxLocksCleanup` или commit). Нужно выяснить, почему оно нужно, и не дублирует ли оно логику из [`kqp_executer_impl.h`](ydb/core/kqp/executer_actor/kqp_executer_impl.h).
+
+**Действия**:
+- Установить, зачем session actor собирает shard'ы OLAP-таблиц
+- Убедиться, что это изменение не является побочным эффектом, который нужно убрать
+
+---
+
+##### 4.1.4 CTAS без `EnablePerStatementQueryExecution`
+
+**Статус**: ⬜ Не исследовано
+
+Без флага CTAS компилируется иначе (не через `TKqlFillTable`/FILL). Нужно выяснить, применяется ли тот же путь или требуется отдельная обработка.
+
+**Действия**:
+- Проверить, как компилируется CTAS при `EnablePerStatementQueryExecution=false`
+- Определить, попадает ли plan в `BuildFillTableEffect` или идёт другим путём
+- При необходимости применить аналогичный подход
+
+---
+
+##### 4.1.5 Удалить `CtasDestinationPath` если не используется
+
+**Статус**: ⬜ Требует проверки
+
+Поле `CtasDestinationPath = 32` добавлено в proto и заполняется в [`FillCreateTableAs`](ydb/core/kqp/query_compiler/kqp_query_compiler.cpp:2456). Table resolver получает sharding-информацию из temp-таблицы (через `ColumnTableInfo` по её `TableId`), а не из destination-таблицы. Если `CtasDestinationPath` нигде не читается — поле можно удалить.
+
+**Действия**:
+- Поиск всех мест использования `CtasDestinationPath` в runtime
+- Удалить поле из proto и компилятора, если оно не нужно
+
+---
+
+##### 4.1.6 Удалить временные debug-флаги из `ya.make`
+
+**Статус**: ⬜ Требует удаления перед мержем
+
+В [`ya.make`](ydb/core/kqp/runtime/ya.make) добавлены временные флаги компиляции:
+```
+-DKQP_WRITE_TABLE_TARGET_SHARD_IDS_CHECK
+-DKQP_WRITE_TABLE_TARGET_SHARD_IDS_EXPECTED_COUNT=1
+```
+и соответствующий `#ifdef`-блок в [`kqp_write_table.cpp:454`](ydb/core/kqp/runtime/kqp_write_table.cpp:454), который проверяет `TargetShardIds->size() == 1`. Эти флаги хардкодят Per-Shard (K=N) и сломают Per-Node (K=M), где `TargetShardIds.size() > 1`. Перед мержем удалить оба флага из `ya.make` и `#ifdef`-блок из `kqp_write_table.cpp`.
+
+---
+
+##### 4.1.7 Бенчмарк
+
+**Статус**: ⬜ Не реализовано
+
+Измерить: сетевой трафик, время выполнения, пиковое потребление памяти — affinity vs baseline (1 задача).
+
+### 4.2 **Вариант B: Per-Node** K = M
+
+> Задачи для этапа B будут уточнены после завершения и стабилизации этапа A (Per-Shard).
+
+Общая идея: сгруппировать шарды по нодам (`P: Shard → Node`), создать M=|{Node}| задач вместо N шардов. Каждая задача обслуживает `{s | P(s) = Nodeⱼ}` шардов. `TargetShardIds` содержит несколько шардов. `ColumnShardHashV1` routing: `TaskIndexByHash[bucket] = j` (нода, не шард).
