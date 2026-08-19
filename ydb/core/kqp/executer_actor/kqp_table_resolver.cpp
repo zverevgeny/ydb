@@ -278,9 +278,30 @@ private:
                 // For CTAS affinity (EnableCsWriteAffinity): extract hash sharding columns
                 // from the target column table so they can be used later in BuildKqpStageChannels
                 // to configure ColumnShardHashV1 shuffle on the upstream Transform Stage.
+                //
+                // For CTAS, ResolvedSinkSettings may be null at this point (the navigate
+                // for ColumnTableInfo can arrive before HandleResolveNames sets it).
+                // Check the raw sink settings proto directly for IsOlap flag.
+                bool isOlapSink = false;
+                if (stageMeta.ResolvedSinkSettings) {
+                    isOlapSink = stageMeta.ResolvedSinkSettings->GetIsOlap();
+                } else {
+                    // Fallback: check raw sink settings proto (CTAS case)
+                    const auto& stage = stageMeta.GetStage(stageId);
+                    for (const auto& sink : stage.GetSinks()) {
+                        if (sink.HasInternalSink()
+                                && sink.GetInternalSink().GetSettings().Is<NKikimrKqp::TKqpTableSinkSettings>()) {
+                            NKikimrKqp::TKqpTableSinkSettings sinkSettings;
+                            if (sink.GetInternalSink().GetSettings().UnpackTo(&sinkSettings)) {
+                                isOlapSink = sinkSettings.GetIsOlap();
+                                break;
+                            }
+                        }
+                    }
+                }
+
                 if (entry.ColumnTableInfo
-                        && stageMeta.ResolvedSinkSettings
-                        && stageMeta.ResolvedSinkSettings->GetIsOlap()
+                        && isOlapSink
                         && stageMeta.Tx.Body->EnableCsWriteAffinity()) {
                     const auto& desc = entry.ColumnTableInfo->Description;
                     if (desc.HasSharding() && desc.GetSharding().HasHashSharding()) {
