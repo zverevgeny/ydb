@@ -2373,27 +2373,39 @@ Y_UNIT_TEST_SUITE(KqpQuery) {
                     PRIMARY KEY (Col1)
                 )
                 PARTITION BY HASH(Col1)
-                WITH (STORE = COLUMN, AUTO_PARTITIONING_MIN_PARTITIONS_COUNT = 4);
+                WITH (STORE = COLUMN, AUTO_PARTITIONING_MIN_PARTITIONS_COUNT = 8);
             )", NYdb::NQuery::TTxControl::NoTx()).ExtractValueSync();
             UNIT_ASSERT_C(result.GetStatus() == NYdb::EStatus::SUCCESS, result.GetIssues().ToString());
-        }
-
-        {
-            auto result = client.ExecuteQuery(R"(
-                REPLACE INTO `/Root/Source` (Col1, Col2) VALUES
-                    (1u, 1), (2u, 2), (3u, 3);
-            )", NYdb::NQuery::TTxControl::BeginTx().CommitTx()).ExtractValueSync();
-            UNIT_ASSERT_C(result.IsSuccess(), result.GetIssues().ToString());
         }
 
         // Build the CTAS query with the pragma set explicitly in both branches.
         // NOTE: the feature is enabled by default, so the "off" branch must set
         // the pragma to "false" explicitly rather than relying on the default.
         const TString pragmaPrefix = EnableCsWriteAffinity
-            ? R"(PRAGMA ydb.EnableCsWriteAffinity = "true";
-)"
-            : R"(PRAGMA ydb.EnableCsWriteAffinity = "false";
-)";
+            ? "PRAGMA ydb.EnableCsWriteAffinity = \"true\";\n"
+            : "PRAGMA ydb.EnableCsWriteAffinity = \"false\";\n";
+
+        Cerr << "QQQ: " << __FILE__ << ": " << __LINE__  << " " << "About to insert" << Endl;
+        {
+            const TString insertQuery = TStringBuilder()
+                << pragmaPrefix
+                << R"(
+                REPLACE INTO `/Root/Source` (Col1, Col2) VALUES
+                    (0u, 0), (1u, 1), (2u, 2), (3u, 3), (4u, 4), (5u, 5), (6u, 6), (7u, 7), (8u, 8), (9u, 9),
+                    (10u, 10), (11u, 11), (12u, 12), (13u, 13), (14u, 14), (15u, 15), (16u, 16), (17u, 17), (18u, 18), (19u, 19),
+                    (20u, 20), (21u, 21), (22u, 22), (23u, 23), (24u, 24), (25u, 25), (26u, 26), (27u, 27), (28u, 28), (29u, 29),
+                    (30u, 30), (31u, 31), (32u, 32), (33u, 33), (34u, 34), (35u, 35), (36u, 36), (37u, 37), (38u, 38), (39u, 39),
+                    (40u, 40), (41u, 41), (42u, 42), (43u, 43), (44u, 44), (45u, 45), (46u, 46), (47u, 47), (48u, 48), (49u, 49),
+                    (50u, 50), (51u, 51), (52u, 52), (53u, 53), (54u, 54), (55u, 55), (56u, 56), (57u, 57), (58u, 58), (59u, 59),
+                    (60u, 60), (61u, 61), (62u, 62), (63u, 63), (64u, 64), (65u, 65), (66u, 66), (67u, 67), (68u, 68), (69u, 69),
+                    (70u, 70), (71u, 71), (72u, 72), (73u, 73), (74u, 74), (75u, 75), (76u, 76), (77u, 77), (78u, 78), (79u, 79);
+            )";
+            auto result = client.ExecuteQuery(insertQuery
+                , NYdb::NQuery::TTxControl::BeginTx().CommitTx()).ExtractValueSync();
+            UNIT_ASSERT_C(result.IsSuccess(), result.GetIssues().ToString());
+        }
+        Cerr << "QQQ: " << __FILE__ << ": " << __LINE__  << " " << "Inserted" << Endl;
+
         const TString ctasQuery = TStringBuilder()
             << pragmaPrefix
             << R"(

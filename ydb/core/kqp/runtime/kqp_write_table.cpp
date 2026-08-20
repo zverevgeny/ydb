@@ -481,6 +481,9 @@ public:
         TGuard guard(*Alloc);
         UnpreparedBatches.clear();
         Batches.clear();
+        if (TargetShardIds.has_value()) {
+            AFL_VERIFY(*TargetShardIds == ActualShardIds)("expected", GetTargetShardIdsDebugString())("actual", GetActualShardIdsDebugString());
+        }
     }
 
     void AddData(IDataBatchPtr&& batch) override {
@@ -500,13 +503,10 @@ public:
         ShardAndFlushBatch(std::move(data), false);
     }
 
-    TString GetTargetShardIdsDebugString() const {
+    static TString GetShardIdsDebugString(const THashSet<ui64>& shardIds) {
         TString result;
-        if (!TargetShardIds.has_value()) {
-            return result;
-        }
         result += "{";
-        for (auto shardId : *TargetShardIds) {
+        for (auto shardId : shardIds) {
             if (result.size() > 1) {
                 result += ", ";
             }
@@ -516,12 +516,26 @@ public:
         return result;
     }
 
+    TString GetActualShardIdsDebugString() const {
+        return GetShardIdsDebugString(ActualShardIds);
+    }
+
+    TString GetTargetShardIdsDebugString() const {
+        TString result;
+        if (!TargetShardIds.has_value()) {
+            return result;
+        }
+        return GetShardIdsDebugString(*TargetShardIds);
+    }
+
     void ShardAndFlushBatch(TRecordBatchPtr&& unshardedBatch, bool force) {
         for (auto [shardId, shardBatch] : Sharding->SplitByShardsToArrowBatches(
                                                     unshardedBatch, NKikimr::NMiniKQL::GetArrowMemoryPool())) {
-            if (TargetShardIds.has_value()) {
-                AFL_VERIFY(TargetShardIds->contains(shardId))("shard_id", shardId)("target_shard_ids", GetTargetShardIdsDebugString());
-            }
+            
+            // if (TargetShardIds.has_value()) {
+            //     AFL_VERIFY(TargetShardIds->contains(shardId))("shard_id", shardId)("target_shard_ids", GetTargetShardIdsDebugString());
+            // }
+            ActualShardIds.insert(shardId);
 
             const i64 shardBatchMemory = NArrow::GetBatchDataSize(shardBatch);
             AFL_ENSURE(shardBatchMemory != 0);
@@ -663,6 +677,7 @@ public:
 private:
     std::shared_ptr<NSharding::IShardingBase> Sharding;
     std::optional<THashSet<ui64>> TargetShardIds; //TODO avoid unnecessary sharding
+    THashSet<ui64> ActualShardIds;
 
 
     const TVector<TSysTables::TTableColumnInfo> Columns;
