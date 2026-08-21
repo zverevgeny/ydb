@@ -2503,21 +2503,17 @@ Y_UNIT_TEST_SUITE(KqpQuery) {
             ? "PRAGMA ydb.EnableCsWriteAffinity = \"true\";\n"
             : "PRAGMA ydb.EnableCsWriteAffinity = \"false\";\n";
 
+        const int insertedRowsCount = 80;
+
         Cerr << "QQQ: " << __FILE__ << ": " << __LINE__  << " " << "About to insert" << Endl;
         {
             const TString insertQuery = TStringBuilder()
                 << pragmaPrefix
-                << R"(
-                REPLACE INTO `/Root/Source` (Col1, Col2) VALUES
-                    (0u, 0), (1u, 1), (2u, 2), (3u, 3), (4u, 4), (5u, 5), (6u, 6), (7u, 7), (8u, 8), (9u, 9),
-                    (10u, 10), (11u, 11), (12u, 12), (13u, 13), (14u, 14), (15u, 15), (16u, 16), (17u, 17), (18u, 18), (19u, 19),
-                    (20u, 20), (21u, 21), (22u, 22), (23u, 23), (24u, 24), (25u, 25), (26u, 26), (27u, 27), (28u, 28), (29u, 29),
-                    (30u, 30), (31u, 31), (32u, 32), (33u, 33), (34u, 34), (35u, 35), (36u, 36), (37u, 37), (38u, 38), (39u, 39),
-                    (40u, 40), (41u, 41), (42u, 42), (43u, 43), (44u, 44), (45u, 45), (46u, 46), (47u, 47), (48u, 48), (49u, 49),
-                    (50u, 50), (51u, 51), (52u, 52), (53u, 53), (54u, 54), (55u, 55), (56u, 56), (57u, 57), (58u, 58), (59u, 59),
-                    (60u, 60), (61u, 61), (62u, 62), (63u, 63), (64u, 64), (65u, 65), (66u, 66), (67u, 67), (68u, 68), (69u, 69),
-                    (70u, 70), (71u, 71), (72u, 72), (73u, 73), (74u, 74), (75u, 75), (76u, 76), (77u, 77), (78u, 78), (79u, 79);
-            )";
+                << "$data = ListMap(ListFromRange(0, " << insertedRowsCount << "), ($x) -> { "
+                << "RETURN AsStruct($x AS Col1, $x AS Col2); });"
+                << "REPLACE INTO `/Root/Source` "
+                << "SELECT Unwrap(CAST(Col1 AS Uint64)) AS Col1, Unwrap(CAST(Col2 AS Int32)) AS Col2 "
+                << "FROM AS_TABLE($data);";
             auto result = client.ExecuteQuery(insertQuery
                 , NYdb::NQuery::TTxControl::BeginTx().CommitTx()).ExtractValueSync();
             UNIT_ASSERT_C(result.IsSuccess(), result.GetIssues().ToString());
@@ -2633,7 +2629,17 @@ Y_UNIT_TEST_SUITE(KqpQuery) {
             )", NYdb::NQuery::TTxControl::BeginTx().CommitTx()).ExtractValueSync();
             UNIT_ASSERT_VALUES_EQUAL_C(it.GetStatus(), EStatus::SUCCESS, it.GetIssues().ToString());
             TString output = StreamResultToYson(it);
-            CompareYson(output, R"([[1u;[1]];[2u;[2]];[3u;[3]]])");
+            // Build expected YSON dynamically from all inserted rows.
+            // Each row is [Col1u;[Col2]] where Col1 = Col2 = i.
+            TString expected = "[";
+            for (int i = 0; i < insertedRowsCount; ++i) {
+                if (i > 0) {
+                    expected += ";";
+                }
+                expected += TStringBuilder() << "[" << i << "u;[" << i << "]]";
+            }
+            expected += "]";
+            CompareYson(output, expected);
         }
     }
 
