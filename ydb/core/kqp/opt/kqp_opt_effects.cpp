@@ -235,7 +235,23 @@ bool BuildFillTableEffect(const TKqlFillTable& node, TExprContext& ctx,
         .Output(dqUnion.Output())
         .Done();
 
-    const bool enableCsWriteAffinity = kqpCtx.Config->EnableCsWriteAffinity.Get().GetOrElse(true);
+    // QP_FORCE_CS_WRITE_AFFINITY: force the per-shard write affinity mode regardless of the PRAGMA.
+    const bool enableCsWriteAffinity =
+#ifdef QP_FORCE_CS_WRITE_AFFINITY
+        true;
+#else
+        kqpCtx.Config->EnableCsWriteAffinity.Get().GetOrElse(true);
+#endif
+
+#ifdef QP_FORCE_CS_WRITE_AFFINITY
+    // kqpCtx is only used to read EnableCsWriteAffinity in the non-force build.
+    Y_UNUSED(kqpCtx);
+#endif
+
+#ifdef QP_FORCE_CS_WRITE_AFFINITY
+    // Invariant: with the force flag, the affinity mode must be enabled.
+    AFL_VERIFY(enableCsWriteAffinity)("msg", "QP_FORCE_CS_WRITE_AFFINITY must force affinity mode");
+#endif
 
     // Stage 4: Affinity marker for sink settings
     //
@@ -358,6 +374,14 @@ bool BuildUpsertRowsEffect(const TKqlUpsertRows& node, TExprContext& ctx, const 
     const bool isOlap = (table.Metadata->Kind == EKikimrTableKind::Olap);
     const i64 priority = (isOlap || settings.AllowInconsistentWrites) ? 0 : order;
 
+    // QP_FORCE_CS_WRITE_AFFINITY: force the per-shard write affinity mode regardless of the PRAGMA.
+    const bool enableCsWriteAffinity =
+#ifdef QP_FORCE_CS_WRITE_AFFINITY
+        true;
+#else
+        kqpCtx.Config->EnableCsWriteAffinity.Get().GetOrElse(true);
+#endif
+
     if (isOlap && !(kqpCtx.IsGenericQuery() || (kqpCtx.IsDataQuery() && kqpCtx.Config->GetAllowOlapDataQuery()))) {
         ctx.AddError(TIssue(ctx.GetPosition(node.Pos()),
             TStringBuilder() << "Data manipulation queries with column-oriented tables are supported only by API QueryService."));
@@ -379,6 +403,94 @@ bool BuildUpsertRowsEffect(const TKqlUpsertRows& node, TExprContext& ctx, const 
             AFL_ENSURE(returning);
             effect = Build<TKqpSinkEffect>(ctx, node.Pos())
                 .Stage(stageInput.Ptr())
+                .SinkIndex().Build("0")
+                .Done();
+        } else if (isOlap && enableCsWriteAffinity) {
+            // Pure OLAP + write affinity: split into Transform + Sink stages.
+            //
+            //   Pure Expression (VALUES)
+            //       ↓ (ToFlow)
+            //   Transform Stage (pure, 0 inputs, 1 task)
+            //       ↓ TDqCnBroadcast
+            //   Sink Stage (N tasks, one per shard, input via Broadcast)
+            //       ↓ TDqSink → TKqpDirectWriteActor
+            //
+            // Broadcast (not Map) lets the Sink Stage have an independent task count
+            // (N, one per shard) from the Transform Stage (1 task).
+            auto sinkSettings = Build<TKqpTableSinkSettings>(ctx, node.Pos())
+                .Table(node.Table())
+                .InconsistentWrite(settings.AllowInconsistentWrites
+                    ? ctx.NewAtom(node.Pos(), "true")
+                    : ctx.NewAtom(node.Pos(), "false"))
+                .StreamWrite(useStreamWrite
+                    ? ctx.NewAtom(node.Pos(), "true")
+                    : ctx.NewAtom(node.Pos(), "false"))
+                .Mode(ctx.NewAtom(node.Pos(), settings.Mode))
+                .Priority(ctx.NewAtom(node.Pos(), ToString(priority)))
+                .IsBatch(node.IsBatch())
+                .IsIndexImplTable(isIndexImplTable
+                    ? ctx.NewAtom(node.Pos(), "true")
+                    : ctx.NewAtom(node.Pos(), "false"))
+                .DefaultColumns(node.DefaultColumns())
+                .ReturningColumns(ctx.NewList(node.Pos(), {}))
+                .Settings()
+                    .Build()
+                .Done();
+
+            auto sink = Build<TDqSink>(ctx, node.Pos())
+                .DataSink<TKqpTableSink>()
+                    .Category(ctx.NewAtom(node.Pos(), NYql::KqpTableSinkName))
+                    .Cluster(ctx.NewAtom(node.Pos(), "db"))
+                    .Build()
+                .Index().Value("0").Build()
+                .Settings(sinkSettings)
+                .Done();
+
+            // Transform Stage: pure expression, no inputs, 1 task.
+            auto transformStage = Build<TDqStage>(ctx, node.Pos())
+                .Inputs()
+                    .Build()
+                .Program()
+                    .Args({})
+                    .Body<TCoToFlow>()
+                        .Input(node.Input())
+                        .Build()
+                    .Build()
+                .Settings().Build()
+                .Done();
+
+            // TDqCnBroadcast: sends all rows from the single Transform task to every Sink task.
+            auto sinkInput = Build<TDqCnBroadcast>(ctx, node.Pos())
+                .Output<TDqOutput>()
+                    .Stage(transformStage)
+                    .Index().Build("0")
+                    .Build()
+                .Done();
+
+            // Distinct argument node for the sink stage lambda (must not be shared
+            // with the transform stage lambda).
+            const auto sinkRowArgument = Build<TCoArgument>(ctx, node.Pos())
+                .Name("sinkRow")
+                .Done();
+
+            auto sinkStage = Build<TDqStage>(ctx, node.Pos())
+                .Inputs()
+                    .Add(sinkInput)
+                    .Build()
+                .Program()
+                    .Args({sinkRowArgument})
+                    .Body<TCoToFlow>()
+                        .Input(sinkRowArgument)
+                        .Build()
+                    .Build()
+                .Outputs<TDqStageOutputsList>()
+                    .Add(sink)
+                    .Build()
+                .Settings().Build()
+                .Done();
+
+            effect = Build<TKqpSinkEffect>(ctx, node.Pos())
+                .Stage(sinkStage.Ptr())
                 .SinkIndex().Build("0")
                 .Done();
         } else {

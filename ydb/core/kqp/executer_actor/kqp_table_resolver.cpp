@@ -322,6 +322,14 @@ private:
                             stageMeta.ShardKey->Partitioning = std::make_shared<TPartitioning>(std::move(partitions));
                         }
                     }
+
+#ifdef QP_FORCE_CS_WRITE_AFFINITY
+                    // Invariant: with the force flag, CsShardingColumns must be populated
+                    // for OLAP sinks so ColumnShardHashV1 routing can be built.
+                    AFL_VERIFY(!stageMeta.CsShardingColumns.empty())
+                        ("stageId", stageId)
+                        ("msg", "QP_FORCE_CS_WRITE_AFFINITY requires CsShardingColumns for OLAP sink");
+#endif
                 }
             }
         }

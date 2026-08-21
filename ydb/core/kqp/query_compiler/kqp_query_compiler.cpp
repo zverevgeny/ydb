@@ -1208,7 +1208,14 @@ private:
         txProto.SetEnableShuffleElimination(Config->OptShuffleElimination.Get().GetOrElse(Config->GetDefaultEnableShuffleElimination()));
         txProto.SetHasEffects(hasEffectStage);
         txProto.SetDqChannelVersion(Config->DqChannelVersion.Get().GetOrElse(Config->GetDqChannelVersion()));
-        txProto.SetEnableCsWriteAffinity(Config->EnableCsWriteAffinity.Get().GetOrElse(true));
+        // QP_FORCE_CS_WRITE_AFFINITY: force the per-shard write affinity mode regardless of the PRAGMA.
+        txProto.SetEnableCsWriteAffinity(
+#ifdef QP_FORCE_CS_WRITE_AFFINITY
+            true
+#else
+            Config->EnableCsWriteAffinity.Get().GetOrElse(true)
+#endif
+        );
         for (const auto& paramBinding : tx.ParamBindings()) {
             TString paramName(paramBinding.Name().Value());
             const auto& binding = paramBinding.Binding();
@@ -2470,6 +2477,13 @@ private:
             const TString destinationPath = TString(TCoNameValueTuple(originalPathNode).Value().Cast<TCoAtom>().StringValue());
             settingsProto.SetCtasDestinationPath(destinationPath);
         }
+
+#ifdef QP_FORCE_CS_WRITE_AFFINITY
+        // Invariant: with the force flag, CtasDestinationPath must be populated
+        // so the resolver can navigate the destination table for affinity.
+        AFL_VERIFY(!settingsProto.GetCtasDestinationPath().empty())
+            ("msg", "QP_FORCE_CS_WRITE_AFFINITY requires CtasDestinationPath");
+#endif
 
         AFL_ENSURE(settings.InconsistentWrite().StringValue() == "true");
         settingsProto.SetInconsistentTx(true);

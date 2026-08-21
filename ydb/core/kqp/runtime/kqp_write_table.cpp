@@ -1,7 +1,9 @@
 #include "kqp_write_table.h"
 
+#include <algorithm>
 #include <util/generic/size_literals.h>
 #include <util/generic/yexception.h>
+#include <util/string/join.h>
 #include <ydb/core/base/fulltext.h>
 #include <ydb/core/base/table_index.h>
 #include <ydb/library/json_index/json_index.h>
@@ -475,6 +477,40 @@ public:
         }
         AFL_ENSURE(shardingConclusion.GetResult() != nullptr);
         Sharding = shardingConclusion.DetachResult();
+
+#ifdef QP_FORCE_CS_WRITE_AFFINITY
+        // Invariant: IShardingBase::OrderedShardIds must match GetColumnShards() order.
+        // kqp_tasks_graph.cpp assigns TargetShardIds[task_i] = GetColumnShards()[i],
+        // and IShardingBase::MakeSharding maps bucket i → OrderedShardIds[i].
+        // A mismatch means rows for the wrong shard arrive at this task and the
+        // AFL_VERIFY in ShardAndFlushBatch fires. Catch it here at construction time
+        // to get a clear early-failure message.
+        {
+            const auto& columnShards = sharding.GetColumnShards();
+            AFL_VERIFY((ui32)columnShards.size() == Sharding->GetShardsCount())
+                ("column_shards_size", columnShards.size())
+                ("sharding_shard_count", Sharding->GetShardsCount())
+                ("msg", "QP_FORCE_CS_WRITE_AFFINITY: shard count mismatch between GetColumnShards() and IShardingBase");
+            for (ui32 i = 0; i < (ui32)columnShards.size(); ++i) {
+                const ui64 fromColumnShards = columnShards[i];
+                const ui64 fromOrderedShardIds = Sharding->GetShardIdByOrderIdx(i);
+                AFL_VERIFY(fromColumnShards == fromOrderedShardIds)
+                    ("idx", i)
+                    ("from_column_shards", fromColumnShards)
+                    ("from_ordered_shard_ids", fromOrderedShardIds)
+                    ("msg", "QP_FORCE_CS_WRITE_AFFINITY: GetColumnShards()[i] != OrderedShardIds[i];"
+                            " kqp_tasks_graph.cpp TargetShardIds assignment uses GetColumnShards() order"
+                            " but IShardingBase::MakeSharding uses OrderedShardIds order; routing is broken");
+            }
+        }
+        // Invariant: when per-shard tasks are used (TargetShardIds set), each task
+        // must own exactly 1 shard.
+        if (TargetShardIds.has_value()) {
+            AFL_VERIFY(TargetShardIds->size() == 1)
+                ("target_shard_ids_count", TargetShardIds->size())
+                ("msg", "QP_FORCE_CS_WRITE_AFFINITY: per-shard task must have exactly 1 TargetShardId");
+        }
+#endif
     }
 
     ~TColumnShardPayloadSerializer() {
@@ -482,7 +518,13 @@ public:
         UnpreparedBatches.clear();
         Batches.clear();
         if (TargetShardIds.has_value()) {
-            AFL_VERIFY(*TargetShardIds == ActualShardIds)("expected", GetTargetShardIdsDebugString())("actual", GetActualShardIdsDebugString());
+            // ActualShardIds must be a subset of TargetShardIds: a task may
+            // receive no rows (empty ActualShardIds is allowed), but it must
+            // never receive rows for a shard it does not own.
+            AFL_VERIFY(std::all_of(ActualShardIds.begin(), ActualShardIds.end(),
+                [&](ui64 shardId) { return TargetShardIds->contains(shardId); }))
+                ("expected", GetTargetShardIdsDebugString())
+                ("actual", GetActualShardIdsDebugString());
         }
     }
 
@@ -531,10 +573,9 @@ public:
     void ShardAndFlushBatch(TRecordBatchPtr&& unshardedBatch, bool force) {
         for (auto [shardId, shardBatch] : Sharding->SplitByShardsToArrowBatches(
                                                     unshardedBatch, NKikimr::NMiniKQL::GetArrowMemoryPool())) {
-            
-            // if (TargetShardIds.has_value()) {
-            //     AFL_VERIFY(TargetShardIds->contains(shardId))("shard_id", shardId)("target_shard_ids", GetTargetShardIdsDebugString());
-            // }
+
+            Cerr << "QQQ_SERIALIZER: shardId=" << shardId
+                 << " targetShardIds=" << GetTargetShardIdsDebugString() << Endl;
             ActualShardIds.insert(shardId);
 
             const i64 shardBatchMemory = NArrow::GetBatchDataSize(shardBatch);
