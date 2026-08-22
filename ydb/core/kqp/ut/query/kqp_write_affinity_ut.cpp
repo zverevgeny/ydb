@@ -65,9 +65,7 @@ static void VerifyPlanWithAffinity(const NJson::TJsonValue& plan, TString planSt
 Y_UNIT_TEST_SUITE(CS_WriteAffinity) {
 
     Y_UNIT_TEST_TWIN(Replace, EnableCsWriteAffinity) {
-        NKikimrConfig::TFeatureFlags featureFlags;
-        featureFlags.SetEnableMoveColumnTable(true);
-        auto settings = TKikimrSettings().SetFeatureFlags(featureFlags).SetWithSampleTables(false);
+        auto settings = TKikimrSettings().SetWithSampleTables(false);
         TKikimrRunner kikimr(settings);
 
         auto client = kikimr.GetQueryClient();
@@ -146,9 +144,7 @@ Y_UNIT_TEST_SUITE(CS_WriteAffinity) {
     }
 
     Y_UNIT_TEST_TWIN(Insert, EnableCsWriteAffinity) {
-        NKikimrConfig::TFeatureFlags featureFlags;
-        featureFlags.SetEnableMoveColumnTable(true);
-        auto settings = TKikimrSettings().SetFeatureFlags(featureFlags).SetWithSampleTables(false);
+        auto settings = TKikimrSettings().SetWithSampleTables(false);
         TKikimrRunner kikimr(settings);
 
         auto client = kikimr.GetQueryClient();
@@ -206,9 +202,7 @@ Y_UNIT_TEST_SUITE(CS_WriteAffinity) {
     }
 
     Y_UNIT_TEST_TWIN(Update, EnableCsWriteAffinity) {
-        NKikimrConfig::TFeatureFlags featureFlags;
-        featureFlags.SetEnableMoveColumnTable(true);
-        auto settings = TKikimrSettings().SetFeatureFlags(featureFlags).SetWithSampleTables(false);
+        auto settings = TKikimrSettings().SetWithSampleTables(false);
         TKikimrRunner kikimr(settings);
 
         auto client = kikimr.GetQueryClient();
@@ -263,9 +257,7 @@ Y_UNIT_TEST_SUITE(CS_WriteAffinity) {
     }
 
     Y_UNIT_TEST_TWIN(Delete, EnableCsWriteAffinity) {
-        NKikimrConfig::TFeatureFlags featureFlags;
-        featureFlags.SetEnableMoveColumnTable(true);
-        auto settings = TKikimrSettings().SetFeatureFlags(featureFlags).SetWithSampleTables(false);
+        auto settings = TKikimrSettings().SetWithSampleTables(false);
         TKikimrRunner kikimr(settings);
 
         auto client = kikimr.GetQueryClient();
@@ -323,11 +315,7 @@ Y_UNIT_TEST_SUITE(CS_WriteAffinity) {
         // and checks that the query plan has different number of stages:
         // - Without pragma: single stage (transform + sink together)
         // - With pragma: two stages (transform stage + separate sink stage)
-        NKikimrConfig::TFeatureFlags featureFlags;
-        featureFlags.SetEnableMoveColumnTable(true);
-        auto settings = TKikimrSettings().SetFeatureFlags(featureFlags).SetWithSampleTables(false);
-        settings.AppConfig.MutableTableServiceConfig()->SetEnableOlapSink(true);
-        settings.AppConfig.MutableTableServiceConfig()->SetEnableCreateTableAs(true);
+        auto settings = TKikimrSettings().SetWithSampleTables(false);
         settings.AppConfig.MutableTableServiceConfig()->SetEnablePerStatementQueryExecution(true);
         TKikimrRunner kikimr(settings);
 
