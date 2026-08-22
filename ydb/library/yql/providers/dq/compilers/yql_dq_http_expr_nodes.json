@@ -1,0 +1,28 @@
+{
+    "NodeRootType": "TExprBase",
+    "NodeBuilderBase": "TNodeBuilderBase",
+    "ListBuilderBase": "TListBuilderBase",
+    "FreeArgCallableBase": "TFreeArgCallable",
+    "FreeArgBuilderBase": "TFreeArgCallableBuilderBase",
+    "Nodes": [
+        {
+            "Name": "TDqHttpLookupSourceSettings",
+            "Base": "TCallable",
+            "Match": {"Type": "Callable", "Name": "DqHttpLookupSourceSettings"},
+            "Children": [
+                {"Index": 0, "Name": "Endpoint", "Type": "TCoAtom"},
+                {"Index": 1, "Name": "PathTemplate", "Type": "TCoAtom"},
+                {"Index": 2, "Name": "Method", "Type": "TCoAtom"},
+                {"Index": 3, "Name": "BodyTemplate", "Type": "TCoAtom"},
+                {"Index": 4, "Name": "Headers", "Type": "TExprBase"},
+                {"Index": 5, "Name": "TimeoutMs", "Type": "TCoAtom"},
+                {"Index": 6, "Name": "CachePolicy", "Type": "TCoAtom"},
+                {"Index": 7, "Name": "CacheTtlSeconds", "Type": "TCoAtom"},
+                {"Index": 8, "Name": "AuthTokenSecretName", "Type": "TCoAtom"},
+                {"Index": 9, "Name": "MaxBatchSize", "Type": "TCoAtom"},
+                {"Index": 10, "Name": "MaxRequestBodySize", "Type": "TCoAtom"},
+                {"Index": 11, "Name": "MaxResponseBodySize", "Type": "TCoAtom"}
+            ]
+        }
+    ]
+}
