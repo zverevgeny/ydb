@@ -24,6 +24,7 @@ PEERDIR(
     ydb/library/yql/dq/actors
     ydb/library/yql/dq/actors/compute/events
     ydb/library/yql/dq/actors/compute/ut/proto
+    ydb/library/yql/dq/actors/http
     ydb/library/yql/dq/actors/input_transforms
     ydb/library/yql/dq/actors/task_runner
     ydb/library/yql/dq/runtime/streaming
