@@ -565,7 +565,71 @@ bool BuildUpsertRowsEffect(const TKqlUpsertRows& node, TExprContext& ctx, const 
             .Done();
 
         auto stageInput = [&]() {
-            if ((table.Metadata->Kind == EKikimrTableKind::Olap && useStreamWrite)
+            if (isOlap && enableCsWriteAffinity) {
+                // Non-pure OLAP + write affinity (UPDATE/INSERT with source):
+                // split into Transform + Sink stages so that the Sink stage
+                // uses wide channels (Multi type) and ColumnShardHashV1 routing
+                // can correctly use numeric indices for key columns.
+                //
+                //   Source (TableFullScan via UnionAll)
+                //       ↓ (Map)
+                //   Transform Stage (mapCn -> ToFlow)         — 1 task (arbitrary node)
+                //       ↓ TDqCnBroadcast                       — all rows sent to every Sink task
+                //   Sink Stage (ToFlow -> DqSink -> TKqpDirectWriteActor)  — N tasks, pinned to shard nodes
+                //
+                // Broadcast (not Map) lets the Sink Stage have an independent task count
+                // (N, one per shard) from the Transform Stage (1 task).
+                // The Transform stage output uses wide channels (Multi type) so that
+                // ColumnShardHashV1 can use numeric indices for key column resolution.
+
+                auto mapCn = Build<TDqCnMap>(ctx, node.Pos())
+                    .Output(dqUnion.Output())
+                    .Done();
+
+                auto transformStage = Build<TDqStage>(ctx, node.Pos())
+                    .Inputs()
+                        .Add(mapCn)
+                        .Build()
+                    .Program()
+                        .Args({rowArgument})
+                        .Body<TCoToFlow>()
+                            .Input(rowArgument)
+                            .Build()
+                        .Build()
+                    .Settings().Build()
+                    .Done();
+
+                // TDqCnBroadcast: sends all rows from the single Transform task to every Sink task.
+                auto sinkInput = Build<TDqCnBroadcast>(ctx, node.Pos())
+                    .Output<TDqOutput>()
+                        .Stage(transformStage)
+                        .Index().Build("0")
+                        .Build()
+                    .Done();
+
+                // Distinct argument node for the sink stage lambda.
+                const auto sinkRowArgument = Build<TCoArgument>(ctx, node.Pos())
+                    .Name("sinkRow")
+                    .Done();
+
+                auto sinkStage = Build<TDqStage>(ctx, node.Pos())
+                    .Inputs()
+                        .Add(sinkInput)
+                        .Build()
+                    .Program()
+                        .Args({sinkRowArgument})
+                        .Body<TCoToFlow>()
+                            .Input(sinkRowArgument)
+                            .Build()
+                        .Build()
+                    .Outputs<TDqStageOutputsList>()
+                        .Add(sink)
+                        .Build()
+                    .Settings().Build()
+                    .Done();
+
+                return sinkStage;
+            } else if ((table.Metadata->Kind == EKikimrTableKind::Olap && useStreamWrite)
                     || settings.AllowInconsistentWrites) {
                 auto mapCn = Build<TDqCnMap>(ctx, node.Pos())
                     .Output(dqUnion.Output())
@@ -738,7 +802,63 @@ bool BuildDeleteRowsEffect(const TKqlDeleteRows& node, TExprContext& ctx, const 
             .Done();
 
         auto stageInput = [&]() {
-            if (table.Metadata->Kind == EKikimrTableKind::Olap) {
+            const bool enableCsWriteAffinity =
+                kqpCtx.Config->EnableCsWriteAffinity.Get().GetOrElse(true);
+            
+            if (isOlap && enableCsWriteAffinity) {
+                // Non-pure OLAP + write affinity (DELETE with source):
+                // split into Transform + Sink stages so that the Sink stage
+                // uses wide channels (Multi type) and ColumnShardHashV1 routing
+                // can correctly use numeric indices for key columns.
+
+                auto mapCn = Build<TDqCnMap>(ctx, node.Pos())
+                    .Output(dqUnion.Output())
+                    .Done();
+
+                auto transformStage = Build<TDqStage>(ctx, node.Pos())
+                    .Inputs()
+                        .Add(mapCn)
+                        .Build()
+                    .Program()
+                        .Args({rowArgument})
+                        .Body<TCoToFlow>()
+                            .Input(rowArgument)
+                            .Build()
+                        .Build()
+                    .Settings().Build()
+                    .Done();
+
+                // TDqCnBroadcast: sends all rows from the single Transform task to every Sink task.
+                auto sinkInput = Build<TDqCnBroadcast>(ctx, node.Pos())
+                    .Output<TDqOutput>()
+                        .Stage(transformStage)
+                        .Index().Build("0")
+                        .Build()
+                    .Done();
+
+                // Distinct argument node for the sink stage lambda.
+                const auto sinkRowArgument = Build<TCoArgument>(ctx, node.Pos())
+                    .Name("sinkRow")
+                    .Done();
+
+                auto sinkStage = Build<TDqStage>(ctx, node.Pos())
+                    .Inputs()
+                        .Add(sinkInput)
+                        .Build()
+                    .Program()
+                        .Args({sinkRowArgument})
+                        .Body<TCoToFlow>()
+                            .Input(sinkRowArgument)
+                            .Build()
+                        .Build()
+                    .Outputs<TDqStageOutputsList>()
+                        .Add(sink)
+                        .Build()
+                    .Settings().Build()
+                    .Done();
+
+                return sinkStage;
+            } else if (table.Metadata->Kind == EKikimrTableKind::Olap) {
                 auto mapCn = Build<TDqCnMap>(ctx, node.Pos())
                     .Output(dqUnion.Output())
                     .Done();
