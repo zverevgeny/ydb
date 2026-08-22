@@ -89,13 +89,14 @@ Y_UNIT_TEST_SUITE(CS_WriteAffinity) {
 
         const int insertedRowsCount = 80;
 
-        const TString query = TStringBuilder()
-            << pragmaPrefix
-            << "$data = ListMap(ListFromRange(0, " << insertedRowsCount << "), ($x) -> { "
-            << "RETURN AsStruct($x AS Col1, $x AS Col2); });"
-            << "REPLACE INTO `/Root/Source` "
-            << "SELECT Unwrap(CAST(Col1 AS Uint64)) AS Col1, Unwrap(CAST(Col2 AS Int32)) AS Col2 "
-            << "FROM AS_TABLE($data);";
+        const TString query = pragmaPrefix +
+            "$rowCount = " + ToString(insertedRowsCount) + ";" + R"(
+            $data = ListMap(ListFromRange(0, $rowCount), ($x) -> {
+            RETURN AsStruct($x AS Col1, $x AS Col2); });
+            REPLACE INTO `/Root/Source`
+            SELECT Unwrap(CAST(Col1 AS Uint64)) AS Col1, Unwrap(CAST(Col2 AS Int32)) AS Col2
+            FROM AS_TABLE($data);
+        )";
 
         {
             auto result = client.ExecuteQuery(
@@ -169,13 +170,14 @@ Y_UNIT_TEST_SUITE(CS_WriteAffinity) {
         const int insertedRowsCount = 80;
 
         {
-            const TString query = TStringBuilder()
-                << pragmaPrefix
-                << "$data = ListMap(ListFromRange(0, " << insertedRowsCount << "), ($x) -> { "
-                << "RETURN AsStruct($x AS Col1, $x AS Col2); });"
-                << "INSERT INTO `/Root/Source` "
-                << "SELECT Unwrap(CAST(Col1 AS Uint64)) AS Col1, Unwrap(CAST(Col2 AS Int32)) AS Col2 "
-                << "FROM AS_TABLE($data);";
+            const TString query = pragmaPrefix +
+                "$rowCount = " + ToString(insertedRowsCount) + ";" + R"(
+                $data = ListMap(ListFromRange(0, $rowCount), ($x) -> {
+                RETURN AsStruct($x AS Col1, $x AS Col2); });
+                INSERT INTO `/Root/Source`
+                SELECT Unwrap(CAST(Col1 AS Uint64)) AS Col1, Unwrap(CAST(Col2 AS Int32)) AS Col2
+                FROM AS_TABLE($data);
+            )";
             auto result = client.ExecuteQuery(query,
                 NYdb::NQuery::TTxControl::BeginTx().CommitTx()).ExtractValueSync();
             UNIT_ASSERT_C(result.IsSuccess(), result.GetIssues().ToString());
@@ -234,9 +236,8 @@ Y_UNIT_TEST_SUITE(CS_WriteAffinity) {
             : "PRAGMA ydb.EnableCsWriteAffinity = \"false\";\n";
 
         // UPDATE: set Col2 = CAST(Col1 * 2 AS Int32) for all rows
-        const TString query = TStringBuilder()
-            << pragmaPrefix
-            << "UPDATE `/Root/Source` SET Col2 = CAST(Col1 * 2 AS Int32);";
+        const TString query = pragmaPrefix +
+            "UPDATE `/Root/Source` SET Col2 = CAST(Col1 * 2 AS Int32);";
 
         {
             auto result = client.ExecuteQuery(query,
@@ -289,9 +290,8 @@ Y_UNIT_TEST_SUITE(CS_WriteAffinity) {
             : "PRAGMA ydb.EnableCsWriteAffinity = \"false\";\n";
 
         // DELETE: remove rows where Col1 > 1
-        const TString query = TStringBuilder()
-            << pragmaPrefix
-            << "DELETE FROM `/Root/Source` WHERE Col1 > 1u;";
+        const TString query = pragmaPrefix +
+            "DELETE FROM `/Root/Source` WHERE Col1 > 1u;";
 
         {
             auto result = client.ExecuteQuery(query,
@@ -341,21 +341,21 @@ Y_UNIT_TEST_SUITE(CS_WriteAffinity) {
         const int insertedRowsCount = 80;
 
         {
-            const TString insertQuery = TStringBuilder()
-                << pragmaPrefix
-                << "$data = ListMap(ListFromRange(0, " << insertedRowsCount << "), ($x) -> { "
-                << "RETURN AsStruct($x AS Col1, $x AS Col2); });"
-                << "REPLACE INTO `/Root/Source` "
-                << "SELECT Unwrap(CAST(Col1 AS Uint64)) AS Col1, Unwrap(CAST(Col2 AS Int32)) AS Col2 "
-                << "FROM AS_TABLE($data);";
+            const TString insertQuery = pragmaPrefix +
+                "$rowCount = " + ToString(insertedRowsCount) + ";" + R"(
+                $data = ListMap(ListFromRange(0, $rowCount), ($x) -> {
+                RETURN AsStruct($x AS Col1, $x AS Col2); });
+                REPLACE INTO `/Root/Source`
+                SELECT Unwrap(CAST(Col1 AS Uint64)) AS Col1, Unwrap(CAST(Col2 AS Int32)) AS Col2
+                FROM AS_TABLE($data);
+            )";
             auto result = client.ExecuteQuery(insertQuery
                 , NYdb::NQuery::TTxControl::BeginTx().CommitTx()).ExtractValueSync();
             UNIT_ASSERT_C(result.IsSuccess(), result.GetIssues().ToString());
         }
 
-        const TString ctasQuery = TStringBuilder()
-            << pragmaPrefix
-            << R"(
+        const TString ctasQuery = pragmaPrefix +
+            R"(
                 CREATE TABLE `/Root/Destination` (
                     PRIMARY KEY (Col1)
                 )
