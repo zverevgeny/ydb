@@ -1,5 +1,7 @@
 #include "init.h"
 
+#include <ydb/library/yql/dq/actors/http/http_lookup_source_factory.h>
+
 #include <ydb/core/fq/libs/audit/yq_audit_service.h>
 #include <ydb/core/fq/libs/checkpoint_storage/storage_service.h>
 #include <ydb/core/fq/libs/cloud_audit/yq_cloud_audit_service.h>
@@ -248,6 +250,7 @@ void Init(
         NYql::NDq::TS3ReadActorFactoryConfig readActorFactoryCfg = NYql::NDq::CreateReadActorFactoryConfig(protoConfig.GetGateways().GetS3());
 
         RegisterDqInputTransformLookupActorFactory(*asyncIoFactory);
+        NYql::NDq::RegisterHttpLookupSourceFactory(*asyncIoFactory);
 
         NYql::TPqGatewayServices pqServices(
             yqSharedResources->UserSpaceYdbDriver,

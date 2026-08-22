@@ -1,4 +1,6 @@
 #include "kqp_compute_actor.h"
+
+#include <ydb/library/yql/dq/actors/http/http_lookup_source_factory.h>
 #include "kqp_compute_actor_impl.h"
 
 #include "kqp_scan_compute_actor.h"
@@ -184,6 +186,7 @@ NYql::NDq::IDqAsyncIoFactory::TPtr CreateKqpAsyncIoFactory(
     RegisterKqpFullTextSource(*factory, counters);
     RegisterKqpSysViewSource(*factory, counters);
     NYql::NDq::RegisterDqInputTransformLookupActorFactory(*factory);
+    NYql::NDq::RegisterHttpLookupSourceFactory(*factory);
 
     if (federatedQuerySetup) {
         auto s3HttpRetryPolicy = NYql::GetFqHTTPRetryPolicy();

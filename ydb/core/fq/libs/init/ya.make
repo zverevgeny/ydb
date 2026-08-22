@@ -33,6 +33,7 @@ PEERDIR(
     ydb/library/folder_service/proto
     ydb/library/security
     ydb/library/yql/dq/actors/compute
+    ydb/library/yql/dq/actors/http
     ydb/library/yql/dq/actors/input_transforms
     ydb/library/yql/dq/transform
     ydb/library/yql/providers/dq/actors
