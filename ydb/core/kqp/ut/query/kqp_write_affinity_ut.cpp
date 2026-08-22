@@ -7,331 +7,368 @@ namespace NKqp {
 using namespace NYdb;
 using namespace NYdb::NQuery;
 
+
 namespace {
 
-// Helper: configure a TKikimrRunner with CTAS / OLAP sink enabled and the
-// EnableCsWriteAffinity feature flag available.  The caller may further
-// customize the settings (e.g. SetNodeCount) before constructing the runner.
-TKikimrSettings MakeCtasSettings() {
+/*
+ * With EnableCsWriteAffinity=true, the pure-expr REPLACE INTO is split into:
+ *   Sink Stage (olap, N tasks, one per shard)
+ *     Broadcast  ← HashShuffle connection, routes rows to correct shard tasks
+ *       Transform Stage (compute, 1 task, generates rows)
+ *
+ * With EnableCsWriteAffinity=false, the sink is inlined into the transform stage
+ * (no separate Sink stage, no Broadcast).
+ */
+void VerifyPlanWithAffinity(const NJson::TJsonValue& plan, TString planStr, bool enableCsWriteAffinity) {
+    const ui32 expectedStages = enableCsWriteAffinity ? 3 : 2;
+    const auto stages = FindPlanStages(plan);
+    UNIT_ASSERT_VALUES_EQUAL_C(stages.size(), expectedStages,
+        "Expected " << expectedStages << " stages (EnableCsWriteAffinity="
+        << enableCsWriteAffinity << "), got " << stages.size()
+        << ". Plan: " << planStr);
+
+    if (enableCsWriteAffinity) {
+        // 1. A Broadcast connection exists (Transform→Sink link).
+        const auto broadcastNode = FindPlanNodeByKv(plan, "Node Type", "Broadcast");
+        UNIT_ASSERT_C(broadcastNode.IsDefined(),
+            "Expected a 'Broadcast' connection in plan with EnableCsWriteAffinity=true. "
+            "Plan: " << planStr);
+
+        // 2. A Sink stage node exists.
+        const auto sinkNode = FindPlanNodeByKv(plan, "Node Type", "Sink");
+        UNIT_ASSERT_C(sinkNode.IsDefined(),
+            "Expected a 'Sink' stage in plan with EnableCsWriteAffinity=true. "
+            "Plan: " << planStr);
+
+        // 3. Broadcast has PlanNodeType=Connection.
+        const auto& broadcastMap = broadcastNode.GetMapSafe();
+        const auto planNodeTypeIt = broadcastMap.find("PlanNodeType");
+        UNIT_ASSERT_C(planNodeTypeIt != broadcastMap.end()
+                && planNodeTypeIt->second.GetStringSafe() == "Connection",
+            "Expected 'Broadcast' to have PlanNodeType=Connection. "
+            "Plan: " << planStr);
+
+        // 4. Exactly 1 Broadcast.
+        const ui32 broadcastCount = CountPlanNodesByKv(plan, "Node Type", "Broadcast");
+        UNIT_ASSERT_VALUES_EQUAL_C(broadcastCount, 1,
+            "Expected exactly 1 Broadcast connection. "
+            "Plan: " << planStr);
+
+        // 5. Inner compute stage exists (Node Type = "Stage").
+        const auto innerStageNode = FindPlanNodeByKv(plan, "Node Type", "Stage");
+        UNIT_ASSERT_C(innerStageNode.IsDefined(),
+            "Expected an inner 'Stage' (compute) in plan with EnableCsWriteAffinity=true. "
+            "Plan: " << planStr);
+    } else {
+        // Without affinity, the sink is inlined — no separate Sink stage, no Broadcast.
+        const auto broadcastNode = FindPlanNodeByKv(plan, "Node Type", "Broadcast");
+        UNIT_ASSERT_C(!broadcastNode.IsDefined(),
+            "Expected NO 'Broadcast' with EnableCsWriteAffinity=false. "
+            "Plan: " << planStr);
+    }
+}
+
+void RunReplaceTest(bool enableCsWriteAffinity) {
     NKikimrConfig::TFeatureFlags featureFlags;
     featureFlags.SetEnableMoveColumnTable(true);
-    auto settings = TKikimrSettings()
-        .SetFeatureFlags(featureFlags)
-        .SetWithSampleTables(false);
-    settings.AppConfig.MutableTableServiceConfig()->SetEnableOlapSink(true);
-    settings.AppConfig.MutableTableServiceConfig()->SetEnableCreateTableAs(true);
-    settings.AppConfig.MutableTableServiceConfig()->SetEnablePerStatementQueryExecution(true);
-    return settings;
-}
+    auto settings = TKikimrSettings().SetFeatureFlags(featureFlags).SetWithSampleTables(false);
+    TKikimrRunner kikimr(settings);
 
-// Helper: build a CTAS query string with the EnableCsWriteAffinity pragma
-// optionally enabled.
-TString BuildCtasQuery(const TString& pragmaPrefix, const TString& source,
-    const TString& dest, const TString& destPk, ui32 minPartitions) {
-    return TStringBuilder()
-        << pragmaPrefix
-        << R"(
-            CREATE TABLE `)" << dest << R"(` (
-                PRIMARY KEY ()" << destPk << R"()
+    auto client = kikimr.GetQueryClient();
+
+    {
+        auto result = client.ExecuteQuery(R"(
+            CREATE TABLE `/Root/Source` (
+                Col1 Uint64 NOT NULL,
+                Col2 Int32,
+                PRIMARY KEY (Col1)
             )
-            PARTITION BY HASH()" << destPk << R"()
-            WITH (STORE = COLUMN, AUTO_PARTITIONING_MIN_PARTITIONS_COUNT = )" << minPartitions << R"()
-            AS SELECT * FROM `)" << source << R"(`;
-        )";
+            PARTITION BY HASH(Col1)
+            WITH (STORE = COLUMN, AUTO_PARTITIONING_MIN_PARTITIONS_COUNT = 8);
+        )", NYdb::NQuery::TTxControl::NoTx()).ExtractValueSync();
+        UNIT_ASSERT_C(result.GetStatus() == NYdb::EStatus::SUCCESS, result.GetIssues().ToString());
+    }
+
+    const TString pragmaPrefix = enableCsWriteAffinity
+        ? "PRAGMA ydb.EnableCsWriteAffinity = \"true\";\n"
+        : "PRAGMA ydb.EnableCsWriteAffinity = \"false\";\n";
+
+    const int insertedRowsCount = 80;
+
+    const TString query = TStringBuilder()
+        << pragmaPrefix
+        << "$data = ListMap(ListFromRange(0, " << insertedRowsCount << "), ($x) -> { "
+        << "RETURN AsStruct($x AS Col1, $x AS Col2); });"
+        << "REPLACE INTO `/Root/Source` "
+        << "SELECT Unwrap(CAST(Col1 AS Uint64)) AS Col1, Unwrap(CAST(Col2 AS Int32)) AS Col2 "
+        << "FROM AS_TABLE($data);";
+
+    {
+        auto result = client.ExecuteQuery(
+            query,
+            NYdb::NQuery::TTxControl::NoTx(),
+            NYdb::NQuery::TExecuteQuerySettings().ExecMode(NQuery::EExecMode::Explain)
+        ).ExtractValueSync();
+        UNIT_ASSERT_C(result.IsSuccess(), result.GetIssues().ToString());
+
+        UNIT_ASSERT_C(result.GetStats().has_value(), "Expected query stats to be present");
+        const auto planStr = result.GetStats()->GetPlan();
+        UNIT_ASSERT_C(planStr.has_value(), "Expected query plan to be present");
+
+        NJson::TJsonValue plan;
+        UNIT_ASSERT_C(NJson::ReadJsonTree(TString(*planStr), &plan, true),
+            "Failed to parse query plan: " << *planStr);
+
+        VerifyPlanWithAffinity(plan, TString(*planStr), enableCsWriteAffinity);
+    }
+
+    {
+        auto result = client.ExecuteQuery(query,
+            NYdb::NQuery::TTxControl::BeginTx().CommitTx()).ExtractValueSync();
+        UNIT_ASSERT_C(result.IsSuccess(), result.GetIssues().ToString());
+    }
+
+    // Verify data was written correctly
+    {
+        auto it = client.StreamExecuteQuery(R"(
+            SELECT Col1, Col2 FROM `/Root/Source` ORDER BY Col1 ASC;
+        )", NYdb::NQuery::TTxControl::BeginTx().CommitTx()).ExtractValueSync();
+        UNIT_ASSERT_VALUES_EQUAL_C(it.GetStatus(), EStatus::SUCCESS, it.GetIssues().ToString());
+        TString output = StreamResultToYson(it);
+
+        // Build expected YSON dynamically from all inserted rows (0..79).
+        // Each row is [Col1u;[Col2]] where Col1 = Col2 = i.
+        TString expected = "[";
+        for (int i = 0; i < insertedRowsCount; ++i) {
+            if (i > 0) {
+                expected += ";";
+            }
+            expected += TStringBuilder() << "[" << i << "u;[" << i << "]]";
+        }
+        expected += "]";
+        CompareYson(output, expected);
+    }
 }
 
-} // namespace
+void RunInsertTest(bool enableCsWriteAffinity) {
+    NKikimrConfig::TFeatureFlags featureFlags;
+    featureFlags.SetEnableMoveColumnTable(true);
+    auto settings = TKikimrSettings().SetFeatureFlags(featureFlags).SetWithSampleTables(false);
+    TKikimrRunner kikimr(settings);
 
-Y_UNIT_TEST_SUITE(KqpWriteAffinity) {
+    auto client = kikimr.GetQueryClient();
 
-    // Verify that a CTAS with a large number of rows produces correct results
-    // when EnableCsWriteAffinity is enabled.  This exercises the per-shard
-    // write path with enough data to span multiple flushes.
-    Y_UNIT_TEST(CTAS_WriteAffinity_LargeData) {
-        auto settings = MakeCtasSettings();
-        TKikimrRunner kikimr(settings);
-        auto client = kikimr.GetQueryClient();
+    {
+        auto result = client.ExecuteQuery(R"(
+            CREATE TABLE `/Root/Source` (
+                Col1 Uint64 NOT NULL,
+                Col2 Int32,
+                PRIMARY KEY (Col1)
+            )
+            PARTITION BY HASH(Col1)
+            WITH (STORE = COLUMN, AUTO_PARTITIONING_MIN_PARTITIONS_COUNT = 8);
+        )", NYdb::NQuery::TTxControl::NoTx()).ExtractValueSync();
+        UNIT_ASSERT_C(result.GetStatus() == NYdb::EStatus::SUCCESS, result.GetIssues().ToString());
+    }
 
-        {
-            auto result = client.ExecuteQuery(R"(
-                CREATE TABLE `/Root/Source` (
-                    Col1 Uint64 NOT NULL,
-                    Col2 Int32,
-                    PRIMARY KEY (Col1)
-                )
-                PARTITION BY HASH(Col1)
-                WITH (STORE = COLUMN, AUTO_PARTITIONING_MIN_PARTITIONS_COUNT = 4);
-            )", TTxControl::NoTx()).ExtractValueSync();
-            UNIT_ASSERT_C(result.GetStatus() == EStatus::SUCCESS, result.GetIssues().ToString());
-        }
+    const TString pragmaPrefix = enableCsWriteAffinity
+        ? "PRAGMA ydb.EnableCsWriteAffinity = \"true\";\n"
+        : "PRAGMA ydb.EnableCsWriteAffinity = \"false\";\n";
 
-        // Insert 100 rows
-        {
-            TStringBuilder sb;
-            sb << "REPLACE INTO `/Root/Source` (Col1, Col2) VALUES ";
-            for (ui32 i = 1; i <= 100; ++i) {
-                if (i > 1) sb << ", ";
-                sb << "(" << i << "u, " << (i32)i << ")";
+    const int insertedRowsCount = 80;
+
+    {
+        const TString query = TStringBuilder()
+            << pragmaPrefix
+            << "$data = ListMap(ListFromRange(0, " << insertedRowsCount << "), ($x) -> { "
+            << "RETURN AsStruct($x AS Col1, $x AS Col2); });"
+            << "INSERT INTO `/Root/Source` "
+            << "SELECT Unwrap(CAST(Col1 AS Uint64)) AS Col1, Unwrap(CAST(Col2 AS Int32)) AS Col2 "
+            << "FROM AS_TABLE($data);";
+        auto result = client.ExecuteQuery(query,
+            NYdb::NQuery::TTxControl::BeginTx().CommitTx()).ExtractValueSync();
+        UNIT_ASSERT_C(result.IsSuccess(), result.GetIssues().ToString());
+    }
+
+    // Verify data was written correctly
+    {
+        auto it = client.StreamExecuteQuery(R"(
+            SELECT Col1, Col2 FROM `/Root/Source` ORDER BY Col1 ASC;
+        )", NYdb::NQuery::TTxControl::BeginTx().CommitTx()).ExtractValueSync();
+        UNIT_ASSERT_VALUES_EQUAL_C(it.GetStatus(), EStatus::SUCCESS, it.GetIssues().ToString());
+        TString output = StreamResultToYson(it);
+
+        // Build expected YSON dynamically from all inserted rows (0..79).
+        TString expected = "[";
+        for (int i = 0; i < insertedRowsCount; ++i) {
+            if (i > 0) {
+                expected += ";";
             }
-            auto result = client.ExecuteQuery(sb, TTxControl::BeginTx().CommitTx()).ExtractValueSync();
-            UNIT_ASSERT_C(result.IsSuccess(), result.GetIssues().ToString());
+            expected += TStringBuilder() << "[" << i << "u;[" << i << "]]";
         }
+        expected += "]";
+        CompareYson(output, expected);
+    }
+}
 
-        const TString pragma = R"(PRAGMA ydb.EnableCsWriteAffinity = "true";
-)";
-        const TString ctasQuery = BuildCtasQuery(pragma, "/Root/Source", "/Root/Destination", "Col1", 2);
+void RunUpdateTest(bool enableCsWriteAffinity) {
+    NKikimrConfig::TFeatureFlags featureFlags;
+    featureFlags.SetEnableMoveColumnTable(true);
+    auto settings = TKikimrSettings().SetFeatureFlags(featureFlags).SetWithSampleTables(false);
+    TKikimrRunner kikimr(settings);
 
-        {
-            auto result = client.ExecuteQuery(ctasQuery, TTxControl::NoTx()).ExtractValueSync();
-            UNIT_ASSERT_C(result.IsSuccess(), result.GetIssues().ToString());
-        }
+    auto client = kikimr.GetQueryClient();
 
-        // Verify all 100 rows were written
-        {
-            auto it = client.StreamExecuteQuery(R"(
-                SELECT COUNT(*) FROM `/Root/Destination`;
-            )", TTxControl::BeginTx().CommitTx()).ExtractValueSync();
-            UNIT_ASSERT_VALUES_EQUAL_C(it.GetStatus(), EStatus::SUCCESS, it.GetIssues().ToString());
-            TString output = StreamResultToYson(it);
-            // The count should be 100
-            UNIT_ASSERT_C(output.Contains("100"), "Expected 100 rows, got: " << output);
-        }
-
-        // Verify a few specific rows
-        {
-            auto it = client.StreamExecuteQuery(R"(
-                SELECT Col1, Col2 FROM `/Root/Destination` WHERE Col1 IN (1u, 50u, 100u) ORDER BY Col1 ASC;
-            )", TTxControl::BeginTx().CommitTx()).ExtractValueSync();
-            UNIT_ASSERT_VALUES_EQUAL_C(it.GetStatus(), EStatus::SUCCESS, it.GetIssues().ToString());
-            TString output = StreamResultToYson(it);
-            CompareYson(output, R"([[1u;[1]];[50u;[50]];[100u;[100]]])");
-        }
+    {
+        auto result = client.ExecuteQuery(R"(
+            CREATE TABLE `/Root/Source` (
+                Col1 Uint64 NOT NULL,
+                Col2 Int32,
+                PRIMARY KEY (Col1)
+            )
+            PARTITION BY HASH(Col1)
+            WITH (STORE = COLUMN, AUTO_PARTITIONING_MIN_PARTITIONS_COUNT = 8);
+        )", NYdb::NQuery::TTxControl::NoTx()).ExtractValueSync();
+        UNIT_ASSERT_C(result.GetStatus() == NYdb::EStatus::SUCCESS, result.GetIssues().ToString());
     }
 
-    // Verify CTAS write affinity works correctly in a multi-node cluster.
-    // With multiple nodes, shards are distributed across nodes, and each
-    // per-shard task should be pinned to the node hosting its shard.
-    Y_UNIT_TEST(CTAS_WriteAffinity_MultiNode) {
-        auto settings = MakeCtasSettings();
-        settings.SetNodeCount(3);
-        TKikimrRunner kikimr(settings);
-        auto client = kikimr.GetQueryClient();
-
-        {
-            auto result = client.ExecuteQuery(R"(
-                CREATE TABLE `/Root/Source` (
-                    Col1 Uint64 NOT NULL,
-                    Col2 Utf8,
-                    PRIMARY KEY (Col1)
-                )
-                PARTITION BY HASH(Col1)
-                WITH (STORE = COLUMN, AUTO_PARTITIONING_MIN_PARTITIONS_COUNT = 8);
-            )", TTxControl::NoTx()).ExtractValueSync();
-            UNIT_ASSERT_C(result.GetStatus() == EStatus::SUCCESS, result.GetIssues().ToString());
-        }
-
-        {
-            auto result = client.ExecuteQuery(R"(
-                REPLACE INTO `/Root/Source` (Col1, Col2) VALUES
-                    (1u, "a"), (2u, "b"), (3u, "c"), (4u, "d"),
-                    (5u, "e"), (6u, "f"), (7u, "g"), (8u, "h");
-            )", TTxControl::BeginTx().CommitTx()).ExtractValueSync();
-            UNIT_ASSERT_C(result.IsSuccess(), result.GetIssues().ToString());
-        }
-
-        const TString pragma = R"(PRAGMA ydb.EnableCsWriteAffinity = "true";
-)";
-        const TString ctasQuery = BuildCtasQuery(pragma, "/Root/Source", "/Root/Destination", "Col1", 4);
-
-        {
-            auto result = client.ExecuteQuery(ctasQuery, TTxControl::NoTx()).ExtractValueSync();
-            UNIT_ASSERT_C(result.IsSuccess(), result.GetIssues().ToString());
-        }
-
-        // Verify all rows
-        {
-            auto it = client.StreamExecuteQuery(R"(
-                SELECT Col1, Col2 FROM `/Root/Destination` ORDER BY Col1 ASC;
-            )", TTxControl::BeginTx().CommitTx()).ExtractValueSync();
-            UNIT_ASSERT_VALUES_EQUAL_C(it.GetStatus(), EStatus::SUCCESS, it.GetIssues().ToString());
-            TString output = StreamResultToYson(it);
-            CompareYson(output, R"([[1u;["a"]];[2u;["b"]];[3u;["c"]];[4u;["d"]];[5u;["e"]];[6u;["f"]];[7u;["g"]];[8u;["h"]]])");
-        }
+    // Insert initial data
+    {
+        auto result = client.ExecuteQuery(R"(
+            REPLACE INTO `/Root/Source` (Col1, Col2)
+            VALUES (1u, 10), (2u, 20), (3u, 30);
+        )", NYdb::NQuery::TTxControl::BeginTx().CommitTx()).ExtractValueSync();
+        UNIT_ASSERT_C(result.IsSuccess(), result.GetIssues().ToString());
     }
 
-    // Verify CTAS write affinity works when the source is a JOIN.
-    // The transform stage computes the JOIN and the sink stage writes the
-    // results with per-shard affinity.
-    Y_UNIT_TEST(CTAS_WriteAffinity_JoinSource) {
-        auto settings = MakeCtasSettings();
-        TKikimrRunner kikimr(settings);
-        auto client = kikimr.GetQueryClient();
+    const TString pragmaPrefix = enableCsWriteAffinity
+        ? "PRAGMA ydb.EnableCsWriteAffinity = \"true\";\n"
+        : "PRAGMA ydb.EnableCsWriteAffinity = \"false\";\n";
 
-        {
-            auto result = client.ExecuteQuery(R"(
-                CREATE TABLE `/Root/SourceA` (
-                    Id Uint64 NOT NULL,
-                    Name Utf8,
-                    PRIMARY KEY (Id)
-                )
-                PARTITION BY HASH(Id)
-                WITH (STORE = COLUMN, AUTO_PARTITIONING_MIN_PARTITIONS_COUNT = 4);
+    // UPDATE: set Col2 = CAST(Col1 * 2 AS Int32) for all rows
+    const TString query = TStringBuilder()
+        << pragmaPrefix
+        << "UPDATE `/Root/Source` SET Col2 = CAST(Col1 * 2 AS Int32);";
 
-                CREATE TABLE `/Root/SourceB` (
-                    Id Uint64 NOT NULL,
-                    Value Int32,
-                    PRIMARY KEY (Id)
-                )
-                PARTITION BY HASH(Id)
-                WITH (STORE = COLUMN, AUTO_PARTITIONING_MIN_PARTITIONS_COUNT = 4);
-            )", TTxControl::NoTx()).ExtractValueSync();
-            UNIT_ASSERT_C(result.GetStatus() == EStatus::SUCCESS, result.GetIssues().ToString());
-        }
+    // NOTE: UPDATE has a source (TableFullScan) and uses Map connection, not Broadcast.
+    // The plan structure differs from pure OLAP stages, so we don't call VerifyPlanWithAffinity.
+    // TODO: Add proper plan verification for UPDATE when CS Write Affinity supports it.
 
-        {
-            auto result = client.ExecuteQuery(R"(
-                REPLACE INTO `/Root/SourceA` (Id, Name) VALUES
-                    (1u, "alpha"), (2u, "beta"), (3u, "gamma");
-                REPLACE INTO `/Root/SourceB` (Id, Value) VALUES
-                    (1u, 100), (2u, 200), (3u, 300);
-            )", TTxControl::BeginTx().CommitTx()).ExtractValueSync();
-            UNIT_ASSERT_C(result.IsSuccess(), result.GetIssues().ToString());
-        }
-
-        const TString pragma = R"(PRAGMA ydb.EnableCsWriteAffinity = "true";
-)";
-        const TString ctasQuery = TStringBuilder()
-            << pragma
-            << R"(
-                CREATE TABLE `/Root/Destination` (
-                    PRIMARY KEY (Id)
-                )
-                PARTITION BY HASH(Id)
-                WITH (STORE = COLUMN, AUTO_PARTITIONING_MIN_PARTITIONS_COUNT = 2)
-                AS SELECT a.Id AS Id, a.Name AS Name, b.Value AS Value
-                FROM `/Root/SourceA` AS a
-                INNER JOIN `/Root/SourceB` AS b ON a.Id = b.Id;
-            )";
-
-        {
-            auto result = client.ExecuteQuery(ctasQuery, TTxControl::NoTx()).ExtractValueSync();
-            UNIT_ASSERT_C(result.IsSuccess(), result.GetIssues().ToString());
-        }
-
-        {
-            auto it = client.StreamExecuteQuery(R"(
-                SELECT Id, Name, Value FROM `/Root/Destination` ORDER BY Id ASC;
-            )", TTxControl::BeginTx().CommitTx()).ExtractValueSync();
-            UNIT_ASSERT_VALUES_EQUAL_C(it.GetStatus(), EStatus::SUCCESS, it.GetIssues().ToString());
-            TString output = StreamResultToYson(it);
-            CompareYson(output, R"([[1u;["alpha"];[100]];[2u;["beta"];[200]];[3u;["gamma"];[300]]])");
-        }
+    {
+        auto result = client.ExecuteQuery(query,
+            NYdb::NQuery::TTxControl::BeginTx().CommitTx()).ExtractValueSync();
+        UNIT_ASSERT_C(result.IsSuccess(), result.GetIssues().ToString());
     }
 
-    // Verify CTAS write affinity works when the source is empty.
-    // The destination table should be created but contain no rows.
-    Y_UNIT_TEST(CTAS_WriteAffinity_EmptySource) {
-        auto settings = MakeCtasSettings();
-        TKikimrRunner kikimr(settings);
-        auto client = kikimr.GetQueryClient();
+    // Verify data was updated correctly
+    {
+        auto it = client.StreamExecuteQuery(R"(
+            SELECT Col1, Col2 FROM `/Root/Source` ORDER BY Col1 ASC;
+        )", NYdb::NQuery::TTxControl::BeginTx().CommitTx()).ExtractValueSync();
+        UNIT_ASSERT_VALUES_EQUAL_C(it.GetStatus(), EStatus::SUCCESS, it.GetIssues().ToString());
+        TString output = StreamResultToYson(it);
+        // Expected: (1, 2), (2, 4), (3, 6)
+        CompareYson(output, "[[1u;[2]];[2u;[4]];[3u;[6]]]");
+    }
+}
 
-        {
-            auto result = client.ExecuteQuery(R"(
-                CREATE TABLE `/Root/Source` (
-                    Col1 Uint64 NOT NULL,
-                    Col2 Int32,
-                    PRIMARY KEY (Col1)
-                )
-                PARTITION BY HASH(Col1)
-                WITH (STORE = COLUMN, AUTO_PARTITIONING_MIN_PARTITIONS_COUNT = 4);
-            )", TTxControl::NoTx()).ExtractValueSync();
-            UNIT_ASSERT_C(result.GetStatus() == EStatus::SUCCESS, result.GetIssues().ToString());
-        }
+void RunDeleteTest(bool enableCsWriteAffinity) {
+    NKikimrConfig::TFeatureFlags featureFlags;
+    featureFlags.SetEnableMoveColumnTable(true);
+    auto settings = TKikimrSettings().SetFeatureFlags(featureFlags).SetWithSampleTables(false);
+    TKikimrRunner kikimr(settings);
 
-        // No data inserted — source is empty
+    auto client = kikimr.GetQueryClient();
 
-        const TString pragma = R"(PRAGMA ydb.EnableCsWriteAffinity = "true";
-)";
-        const TString ctasQuery = BuildCtasQuery(pragma, "/Root/Source", "/Root/Destination", "Col1", 2);
-
-        {
-            auto result = client.ExecuteQuery(ctasQuery, TTxControl::NoTx()).ExtractValueSync();
-            UNIT_ASSERT_C(result.IsSuccess(), result.GetIssues().ToString());
-        }
-
-        // Verify destination is empty
-        {
-            auto it = client.StreamExecuteQuery(R"(
-                SELECT COUNT(*) FROM `/Root/Destination`;
-            )", TTxControl::BeginTx().CommitTx()).ExtractValueSync();
-            UNIT_ASSERT_VALUES_EQUAL_C(it.GetStatus(), EStatus::SUCCESS, it.GetIssues().ToString());
-            TString output = StreamResultToYson(it);
-            UNIT_ASSERT_C(output.Contains("0"), "Expected 0 rows, got: " << output);
-        }
+    {
+        auto result = client.ExecuteQuery(R"(
+            CREATE TABLE `/Root/Source` (
+                Col1 Uint64 NOT NULL,
+                Col2 Int32,
+                PRIMARY KEY (Col1)
+            )
+            PARTITION BY HASH(Col1)
+            WITH (STORE = COLUMN, AUTO_PARTITIONING_MIN_PARTITIONS_COUNT = 8);
+        )", NYdb::NQuery::TTxControl::NoTx()).ExtractValueSync();
+        UNIT_ASSERT_C(result.GetStatus() == NYdb::EStatus::SUCCESS, result.GetIssues().ToString());
     }
 
-    // Verify CTAS write affinity works with a composite (multi-column) primary key.
-    // The sharding hash is computed over multiple key columns.
-    Y_UNIT_TEST(CTAS_WriteAffinity_CompositeKey) {
-        auto settings = MakeCtasSettings();
-        TKikimrRunner kikimr(settings);
-        auto client = kikimr.GetQueryClient();
-
-        {
-            auto result = client.ExecuteQuery(R"(
-                CREATE TABLE `/Root/Source` (
-                    PartKey Uint64 NOT NULL,
-                    SortKey Uint32 NOT NULL,
-                    Data Utf8,
-                    PRIMARY KEY (PartKey, SortKey)
-                )
-                PARTITION BY HASH(PartKey)
-                WITH (STORE = COLUMN, AUTO_PARTITIONING_MIN_PARTITIONS_COUNT = 4);
-            )", TTxControl::NoTx()).ExtractValueSync();
-            UNIT_ASSERT_C(result.GetStatus() == EStatus::SUCCESS, result.GetIssues().ToString());
-        }
-
-        {
-            auto result = client.ExecuteQuery(R"(
-                REPLACE INTO `/Root/Source` (PartKey, SortKey, Data) VALUES
-                    (1u, 10u, "row1"), (1u, 20u, "row2"),
-                    (2u, 10u, "row3"), (2u, 20u, "row4"),
-                    (3u, 10u, "row5"), (3u, 20u, "row6");
-            )", TTxControl::BeginTx().CommitTx()).ExtractValueSync();
-            UNIT_ASSERT_C(result.IsSuccess(), result.GetIssues().ToString());
-        }
-
-        const TString pragma = R"(PRAGMA ydb.EnableCsWriteAffinity = "true";
-)";
-        const TString ctasQuery = TStringBuilder()
-            << pragma
-            << R"(
-                CREATE TABLE `/Root/Destination` (
-                    PRIMARY KEY (PartKey, SortKey)
-                )
-                PARTITION BY HASH(PartKey)
-                WITH (STORE = COLUMN, AUTO_PARTITIONING_MIN_PARTITIONS_COUNT = 2)
-                AS SELECT * FROM `/Root/Source`;
-            )";
-
-        {
-            auto result = client.ExecuteQuery(ctasQuery, TTxControl::NoTx()).ExtractValueSync();
-            UNIT_ASSERT_C(result.IsSuccess(), result.GetIssues().ToString());
-        }
-
-        // Verify all rows
-        {
-            auto it = client.StreamExecuteQuery(R"(
-                SELECT PartKey, SortKey, Data FROM `/Root/Destination`
-                ORDER BY PartKey ASC, SortKey ASC;
-            )", TTxControl::BeginTx().CommitTx()).ExtractValueSync();
-            UNIT_ASSERT_VALUES_EQUAL_C(it.GetStatus(), EStatus::SUCCESS, it.GetIssues().ToString());
-            TString output = StreamResultToYson(it);
-            CompareYson(output, R"([[1u;10u;["row1"]];[1u;20u;["row2"]];[2u;10u;["row3"]];[2u;20u;["row4"]];[3u;10u;["row5"]];[3u;20u;["row6"]]])");
-        }
+    // Insert initial data
+    {
+        auto result = client.ExecuteQuery(R"(
+            REPLACE INTO `/Root/Source` (Col1, Col2)
+            VALUES (1u, 10), (2u, 20), (3u, 30);
+        )", NYdb::NQuery::TTxControl::BeginTx().CommitTx()).ExtractValueSync();
+        UNIT_ASSERT_C(result.IsSuccess(), result.GetIssues().ToString());
     }
 
-} // Y_UNIT_TEST_SUITE(KqpWriteAffinity)
+    const TString pragmaPrefix = enableCsWriteAffinity
+        ? "PRAGMA ydb.EnableCsWriteAffinity = \"true\";\n"
+        : "PRAGMA ydb.EnableCsWriteAffinity = \"false\";\n";
+
+    // DELETE: remove rows where Col1 > 1
+    const TString query = TStringBuilder()
+        << pragmaPrefix
+        << "DELETE FROM `/Root/Source` WHERE Col1 > 1u;";
+
+    // NOTE: DELETE has a source (TableFullScan) and uses Map connection, not Broadcast.
+    // The plan structure differs from pure OLAP stages, so we don't call VerifyPlanWithAffinity.
+    // TODO: Add proper plan verification for DELETE when CS Write Affinity supports it.
+
+    {
+        auto result = client.ExecuteQuery(query,
+            NYdb::NQuery::TTxControl::BeginTx().CommitTx()).ExtractValueSync();
+        UNIT_ASSERT_C(result.IsSuccess(), result.GetIssues().ToString());
+    }
+
+    // Verify only row with Col1=1 remains
+    {
+        auto it = client.StreamExecuteQuery(R"(
+            SELECT Col1, Col2 FROM `/Root/Source` ORDER BY Col1 ASC;
+        )", NYdb::NQuery::TTxControl::BeginTx().CommitTx()).ExtractValueSync();
+        UNIT_ASSERT_VALUES_EQUAL_C(it.GetStatus(), EStatus::SUCCESS, it.GetIssues().ToString());
+        TString output = StreamResultToYson(it);
+        CompareYson(output, "[[1u;[10]]]");
+    }
+}
+
+} // anonymous namespace
+
+Y_UNIT_TEST_SUITE(CS_WriteAffinity) {
+
+    Y_UNIT_TEST(Replace_EnableCsWriteAffinity_True) {
+        RunReplaceTest(true);
+    }
+
+    Y_UNIT_TEST(Replace_EnableCsWriteAffinity_False) {
+        RunReplaceTest(false);
+    }
+
+    Y_UNIT_TEST(Insert_EnableCsWriteAffinity_True) {
+        RunInsertTest(true);
+    }
+
+    Y_UNIT_TEST(Insert_EnableCsWriteAffinity_False) {
+        RunInsertTest(false);
+    }
+
+    Y_UNIT_TEST(Update_EnableCsWriteAffinity_True) {
+        RunUpdateTest(true);
+    }
+
+    Y_UNIT_TEST(Update_EnableCsWriteAffinity_False) {
+        RunUpdateTest(false);
+    }
+
+    Y_UNIT_TEST(Delete_EnableCsWriteAffinity_True) {
+        RunDeleteTest(true);
+    }
+
+    Y_UNIT_TEST(Delete_EnableCsWriteAffinity_False) {
+        RunDeleteTest(false);
+    }
+
+} // Y_UNIT_TEST_SUITE(CS_WriteAffinity)
 
 } // namespace NKqp
 } // namespace NKikimr
