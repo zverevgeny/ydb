@@ -11,6 +11,7 @@
 #include <ydb/library/yql/dq/actors/compute/dq_compute_actor_channels.h>
 #include <ydb/library/yql/dq/actors/compute/dq_compute_actor_log.h>
 #include <ydb/library/yql/dq/actors/compute/ut/proto/mock.pb.h>
+#include <ydb/library/yql/dq/actors/http/http_lookup_source_factory.h>
 #include <ydb/library/yql/dq/actors/input_transforms/dq_input_transform_lookup_factory.h>
 #include <ydb/library/yql/dq/actors/task_runner/task_runner_actor.h>
 #include <ydb/library/yql/dq/comp_nodes/yql_common_dq_factory.h>
@@ -128,6 +129,7 @@ NDq::IDqAsyncIoFactory::TPtr CreateAsyncIoFactory() {
     auto factory = MakeIntrusive<NYql::NDq::TDqAsyncIoFactory>();
     RegisterMockProviderFactories(*factory);
     RegisterDqInputTransformLookupActorFactory(*factory);
+    NHttpEgress::RegisterHttpLookupSourceFactory(*factory);
     return factory;
 }
 
