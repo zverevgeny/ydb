@@ -577,11 +577,17 @@ TInternalPathId TTablesManager::TruncateTable(const TSchemeShardLocalPathId sche
     AFL_VERIFY(GenerateInternalPathId)("error", "truncate requires GenerateInternalPathId");
     const auto newPathId = GenerateNextInternalPathId();
 
+    //TODO think here
     TTableInfo newTable({ TUnifiedPathId::BuildValid(newPathId, schemeShardLocalPathId) });
     RegisterTable(std::move(newTable), db);
 
+
     // Clear the propose-time fence now that the live mapping points at the new generation.
     AFL_VERIFY(TruncatingLocalToInternal.erase(schemeShardLocalPathId));
+
+    //TODO think or here
+    TTableInfo newTable({ TUnifiedPathId::BuildValid(newPathId, schemeShardLocalPathId) });
+    RegisterTable(std::move(newTable), db);
 
     AFL_INFO(NKikimrServices::TX_COLUMNSHARD)("method", "TruncateTable")("ss_local_path_id", schemeShardLocalPathId)(
         "old_internal_path_id", oldPathId)("new_internal_path_id", newPathId)("version", version.DebugString());

@@ -233,10 +233,6 @@ TTxController::TProposeResult TSchemaTransactionOperator::DoStartProposeOnExecut
                 return TProposeResult(NKikimrTxColumnShard::EResultStatus::SCHEMA_ERROR,
                     "Cannot truncate column table without GenerateInternalPathId");
             }
-            if (owner.TablesManager.IsStoreTablet()) {
-                return TProposeResult(
-                    NKikimrTxColumnShard::EResultStatus::SCHEMA_ERROR, "TRUNCATE is not supported for tables in a table store");
-            }
             const auto schemeShardLocalPathId = TSchemeShardLocalPathId::FromProto(SchemaTxBody.GetTruncateTable());
             const auto internalPathId = owner.TablesManager.ResolveInternalPathId(schemeShardLocalPathId, false);
             if (!internalPathId) {
@@ -388,10 +384,8 @@ void TSchemaTransactionOperator::DoOnTabletInit(TColumnShard& owner) {
             owner.TablesManager.CopyTablePropose(srcSchemeShardLocalPathId);
         } break;
         case NKikimrTxColumnShard::TSchemaTxBody::kTruncateTable: {
-            AFL_VERIFY(owner.TablesManager.IsGenerateInternalPathId())("error", "truncate requires GenerateInternalPathId");
-            if (owner.TablesManager.IsStoreTablet()) {
-                break;
-            }
+            AFL_VERIFY(owner.TablesManager.IsGenerateInternalPathId())(
+                "error", "truncate requires GenerateInternalPathId");
             const auto schemeShardLocalPathId = TSchemeShardLocalPathId::FromProto(SchemaTxBody.GetTruncateTable());
             // After restart Truncating fence is empty and GenerationIndex.Live is
             // rebuilt from DB. Re-fence the path (same as MoveTablePropose replay) so writes stay
