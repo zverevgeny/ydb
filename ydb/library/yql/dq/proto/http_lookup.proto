@@ -1,43 +1,41 @@
-syntax = "proto2";
+syntax = "proto3";
 
 package Ydb.Dq.HttpLookup;
 
-option java_package = "Ydb.Dq.HttpLookup";
-
-import "ydb/library/yql/dq/actors/http/proto/http_egress.proto";
+import "ydb/library/yql/dq/proto/http_egress.proto";
 
 // Settings for the HTTP lookup source (Phase 2).
 // Configures how the lookup source builds HTTP requests from keys.
 message TDqHttpLookupSourceSettings {
     // HTTP method (GET, POST, PUT, etc.).
-    optional string method = 1 [default = "GET"];
+    string method = 1;
 
     // Base URL for the HTTP endpoint (e.g., "http://api.example.com/v1").
-    optional string endpoint = 2;
+    string endpoint = 2;
 
     // Path template: key value is substituted for {key} placeholder.
     // Example: "/lookup/{key}" → "/lookup/abc123"
-    optional string path_template = 3;
+    string path_template = 3;
 
     // Body template for POST/PUT requests.
     // {key} is substituted with the lookup key value.
-    optional string body_template = 4;
+    string body_template = 4;
 
     // Custom headers to include in each request.
     message Header {
-        optional string name = 1;
-        optional string value = 2;
+        string name = 1;
+        string value = 2;
     }
     repeated Header headers = 5;
 
     // Timeout for individual HTTP requests in milliseconds (default 5000).
-    optional uint64 timeout_ms = 6 [default = 5000];
+    uint64 timeout_ms = 6;
 
     // Maximum batch size for lookup requests (default 100).
-    optional uint64 max_batch_size = 7 [default = 100];
+    uint64 max_batch_size = 7;
 
     // Maximum response body size in bytes (default 1MB).
-    optional uint64 max_response_size = 8 [default = 1048576];
+    uint64 max_response_size = 8;
 
     // Cache policy: whether to cache responses.
     enum CachePolicy {
@@ -45,14 +43,14 @@ message TDqHttpLookupSourceSettings {
         CACHE_IN_BATCH = 1;  // Dedupe within a single batch only
         CACHE_ACROSS_BATCHES = 2;  // Dedupe across batches (with TTL)
     }
-    optional CachePolicy cache_policy = 9 [default = CACHE_IN_BATCH];
+    CachePolicy cache_policy = 9;
 
     // Cache TTL in seconds (for CACHE_ACROSS_BATCHES).
-    optional uint64 cache_ttl_seconds = 10 [default = 60];
+    uint64 cache_ttl_seconds = 10;
 
     // Egress security config (allowed hosts, etc.).
-    optional Ydb.Dq.HttpEgress.TDqHttpEgressSettings egress_settings = 11;
+    Ydb.Dq.HttpEgress.TDqHttpEgressSettings egress_settings = 11;
 
     // Secret name for authorization token (resolved at runtime).
-    optional string auth_token_secret_name = 12;
+    string auth_token_secret_name = 12;
 }

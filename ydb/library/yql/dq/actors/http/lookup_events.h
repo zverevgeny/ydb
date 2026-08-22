@@ -10,7 +10,7 @@ namespace NYql::NDq::NHttpEgress {
 // Lookup request event: sent by THttpLookupSource to THttpLookupReceiver.
 // This carries the request map from the source to the receiver actor.
 struct TEvLookupRequest : public NActors::TEventLocal<TEvLookupRequest, 1000100> {
-    using TUnboxedValueMap = IDqAsyncLookupSource::TUnboxedValueMap;
+    using TUnboxedValueMap = NYql::NDq::IDqAsyncLookupSource::TUnboxedValueMap;
 
     explicit TEvLookupRequest(std::shared_ptr<TUnboxedValueMap> request)
         : Request(std::move(request))

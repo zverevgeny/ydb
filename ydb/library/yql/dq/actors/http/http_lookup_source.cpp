@@ -6,7 +6,6 @@
 
 #include <util/generic/string.h>
 #include <util/string/builder.h>
-#include <util/system/time.h>
 
 #include <algorithm>
 #include <cctype>
@@ -18,23 +17,30 @@ namespace NYql::NDq::NHttpEgress {
 ///////////////////////////////////////////////////////////////////////////////
 
 THttpLookupReceiver::THttpLookupReceiver(
-    NActors::TActorId egressActorId,
     NActors::TActorId resultTarget,
     Ydb::Dq::HttpLookup::TDqHttpLookupSourceSettings settings,
+    TEgressSecurityConfig securityConfig,
     IMemoryQuotaManager::TPtr memoryQuotaManager,
     const THashMap<TString, TString>& secureParams,
     std::shared_ptr<NKikimr::NMiniKQL::TScopedAlloc> alloc,
     const NKikimr::NMiniKQL::TStructType* payloadType,
     const NKikimr::NMiniKQL::THolderFactory& holderFactory)
     : Settings(std::move(settings))
-    , EgressActorId(egressActorId)
-    , ResultTarget(resultTarget)
+    , SecurityConfig(std::move(securityConfig))
+    , ResultTarget(std::move(resultTarget))
     , MemoryQuotaManager(std::move(memoryQuotaManager))
     , SecureParams(secureParams)
     , Alloc(std::move(alloc))
     , PayloadType(payloadType)
     , HolderFactory(holderFactory)
 {
+}
+
+void THttpLookupReceiver::Bootstrap(const NActors::TActorContext& ctx) {
+    // Create the egress actor as a child of this receiver.
+    auto* egressActor = CreateHttpEgressActor(SecurityConfig, nullptr);
+    EgressActorId = ctx.Self.Send(egressActor, new NActors::TEvents::TEvBootstrap());
+    this->Become(&THttpLookupReceiver::StateFunc);
 }
 
 STFUNC(THttpLookupReceiver::StateFunc) {
@@ -54,7 +60,7 @@ void THttpLookupReceiver::HandleLookupRequest(
     TEvLookupRequest::TPtr& ev,
     const NActors::TActorContext& ctx)
 {
-    ProcessLookup(std::move(ev->Request));
+    ProcessLookup(std::move(ev->Get()->Request), ctx);
 }
 
 TString THttpLookupReceiver::BuildUrl(TStringBuf key) const {
@@ -69,7 +75,7 @@ TString THttpLookupReceiver::BuildUrl(TStringBuf key) const {
 }
 
 TString THttpLookupReceiver::BuildBody(TStringBuf key) const {
-    if (!Settings.has_body_template() || Settings.body_template().empty()) {
+    if (Settings.body_template().empty()) {
         return {};
     }
     TString body = Settings.body_template();
@@ -174,14 +180,16 @@ TString THttpLookupReceiver::UrlEncode(TStringBuf input) {
 }
 
 void THttpLookupReceiver::ProcessLookup(
-    std::shared_ptr<IDqAsyncLookupSource::TUnboxedValueMap> request)
+    std::shared_ptr<NYql::NDq::IDqAsyncLookupSource::TUnboxedValueMap> request,
+    const NActors::TActorContext& ctx)
 {
-    using TUnboxedValue = NKikimr::NMiniKQL::TUnboxedValue;
+    using TUnboxedValue = NKikimr::NUdf::TUnboxedValue;
 
     // Guard against concurrent lookups — the receiver is designed for sequential processing.
     // If the compute actor sends overlapping lookups, the second will fail fast.
-    Y_ASSERT(PendingRequests.empty(),
-        "THttpLookupReceiver: concurrent lookups not supported — previous lookup still in progress");
+    if (Y_UNLIKELY(!PendingRequests.empty())) {
+        ywarn("THttpLookupReceiver: concurrent lookups not supported");
+    }
 
     if (!request || request->empty()) {
         // Empty request — send empty result immediately.
@@ -238,10 +246,10 @@ void THttpLookupReceiver::ProcessLookup(
         }
 
         // Calculate timeout.
-        TDuration timeout = TDuration::Milliseconds(Settings.timeout_ms());
+        TDuration timeout = TDuration::MilliSeconds(Settings.timeout_ms());
 
         // Set wakeup for timeout.
-        ctx.ScheduleTimeout(+ctx, new NActors::TEvents::TEvWakeup(requestId), timeout);
+        ctx.Schedule(SelfId(), new NActors::TEvents::TEvWakeup(requestId), timeout);
 
         // Send request to egress actor, targeting self as the response actor.
         auto* req = new TEvHttpEgress::TEvHttpRequest(
@@ -251,9 +259,9 @@ void THttpLookupReceiver::ProcessLookup(
             headers,
             body,
             timeout,
-            NActors::self()->ID());
+            SelfId());
 
-        NActors::Send(EgressActorId, req);
+        ctx.Send(EgressActorId, req);
     }
 
     // If all keys were cache hits (no pending requests), send result immediately.
@@ -264,9 +272,9 @@ void THttpLookupReceiver::ProcessLookup(
 
 void THttpLookupReceiver::HandleHttpResponse(
     TEvHttpEgress::TEvHttpResponse::TPtr& ev,
-    const NActors::TActorContext& ctx)
+    const NActors::TActorContext& /* ctx */)
 {
-    ui64 requestId = ev->RequestId;
+    ui64 requestId = ev->Get()->RequestId;
     auto it = PendingRequests.find(requestId);
     if (it == PendingRequests.end()) {
         // Stale response (already timed out), ignore.
@@ -278,12 +286,12 @@ void THttpLookupReceiver::HandleHttpResponse(
 
     // Build response object.
     TLookupResponse response;
-    response.StatusCode = ev->StatusCode;
-    response.Body = ev->Body;
-    response.Success = ev->StatusCode >= 200 && ev->StatusCode < 300;
+    response.StatusCode = ev->Get()->StatusCode;
+    response.Body = ev->Get()->Body;
+    response.Success = ev->Get()->StatusCode >= 200 && ev->Get()->StatusCode < 300;
 
-    // Check response body size limit.
-    if (Settings.has_max_response_size() && response.Body.size() > Settings.max_response_size()) {
+    // Check response body size limit (0 means no limit in proto3).
+    if (Settings.max_response_size() && response.Body.size() > Settings.max_response_size()) {
         response.Success = false;
         response.Error = "Response body exceeds maximum size";
     }
@@ -314,9 +322,9 @@ void THttpLookupReceiver::HandleHttpResponse(
 
 void THttpLookupReceiver::HandleHttpError(
     TEvHttpEgress::TEvHttpError::TPtr& ev,
-    const NActors::TActorContext& ctx)
+    const NActors::TActorContext& /* ctx */)
 {
-    ui64 requestId = ev->RequestId;
+    ui64 requestId = ev->Get()->RequestId;
     auto it = PendingRequests.find(requestId);
     if (it == PendingRequests.end()) {
         // Stale error (already timed out), ignore.
@@ -329,7 +337,7 @@ void THttpLookupReceiver::HandleHttpError(
     // Store error response.
     TLookupResponse response;
     response.Success = false;
-    response.Error = ev->Message;
+    response.Error = ev->Get()->Message;
     CompletedResponses[keyStr] = response;
 
     // Check if all requests completed.
@@ -340,9 +348,9 @@ void THttpLookupReceiver::HandleHttpError(
 
 void THttpLookupReceiver::HandleWakeup(
     NActors::TEvents::TEvWakeup::TPtr& ev,
-    const NActors::TActorContext& ctx)
+    const NActors::TActorContext& /* ctx */)
 {
-    ui64 requestId = ev->Tag;
+    ui64 requestId = ev->Cookie;
     auto it = PendingRequests.find(requestId);
     if (it != PendingRequests.end()) {
         const TString& keyStr = it->second;
@@ -377,9 +385,7 @@ NKikimr::NUdf::TUnboxedValue THttpLookupReceiver::ConvertResponseToValue(
     }
 
     // Validate PayloadType has at least 3 members: StatusCode, Headers, Body.
-    Y_ASSERT(PayloadType->GetMembersCount() >= 3,
-        "THttpLookupReceiver: PayloadType must have at least 3 members (StatusCode, Headers, Body), "
-        "got %lu", static_cast<unsigned long>(PayloadType->GetMembersCount()));
+    Y_ASSERT(PayloadType->GetMembersCount() >= 3);
 
     // Build Struct<StatusCode, Headers, Body> using HolderFactory.
     // The PayloadType is expected to be a struct with 3 members:
@@ -390,7 +396,7 @@ NKikimr::NUdf::TUnboxedValue THttpLookupReceiver::ConvertResponseToValue(
     auto result = HolderFactory.CreateDirectArrayHolder(3, valueItems);
 
     // Field 0: StatusCode (ui32)
-    valueItems[0] = NKikimr::NMiniKQL::MakeEmbeddedValue(response.StatusCode);
+    valueItems[0] = TUnboxedValue(response.StatusCode);
 
     // Field 1: Headers (string) — empty for now, could be populated from response headers
     valueItems[1] = NKikimr::NMiniKQL::MakeString(NUdf::TStringRef());
@@ -403,7 +409,7 @@ NKikimr::NUdf::TUnboxedValue THttpLookupReceiver::ConvertResponseToValue(
 
 void THttpLookupReceiver::Free() {
     if (Alloc) {
-        auto guard = NKikimr::NMiniKQL::Guard(*Alloc);
+        auto guard = Guard(*Alloc);
         CurrentRequest.reset();
         CompletedResponses.clear();
         Cache.clear();
@@ -411,11 +417,11 @@ void THttpLookupReceiver::Free() {
 }
 
 void THttpLookupReceiver::SendResult() {
-    using TUnboxedValue = NKikimr::NMiniKQL::TUnboxedValue;
-    using TUnboxedValueMap = IDqAsyncLookupSource::TUnboxedValueMap;
+    using TUnboxedValue = NKikimr::NUdf::TUnboxedValue;
+    using TUnboxedValueMap = NYql::NDq::IDqAsyncLookupSource::TUnboxedValueMap;
 
     // Build result map from completed responses.
-    TUnboxedValueMap results;
+    TUnboxedValueMap results(Alloc.get());
 
     if (CurrentRequest) {
         for (const auto& [key, value] : *CurrentRequest) {
@@ -456,9 +462,9 @@ void THttpLookupReceiver::PassAway() {
 
 THttpLookupSource::THttpLookupSource(
     Ydb::Dq::HttpLookup::TDqHttpLookupSourceSettings settings,
-    NActors::TActorId receiverActorId)
+    NActors::IActor* receiverActor)
     : Settings(std::move(settings))
-    , ReceiverActorId(std::move(receiverActorId))
+    , ReceiverActor(receiverActor)
 {
 }
 
@@ -474,39 +480,58 @@ void THttpLookupSource::AsyncLookup(std::weak_ptr<TUnboxedValueMap> request) {
     }
 
     // Send lookup request to the receiver actor.
-    NActors::Send(ReceiverActorId, new TEvLookupRequest(std::move(sharedRequest)));
+    this->Send(ReceiverActor->ID(), new TEvLookupRequest(std::move(sharedRequest)));
 }
 
 NActors::IActor* THttpLookupSource::GetReceiverActor() {
-    // The actual actor pointer is managed by the factory.
-    // This method is a placeholder for future use.
-    return nullptr;
+    return ReceiverActor;
 }
 
 ///////////////////////////////////////////////////////////////////////////////
 // Factory
 ///////////////////////////////////////////////////////////////////////////////
 
-std::pair<IDqAsyncLookupSource*, NActors::IActor*> CreateHttpLookupSourcePair(
+std::pair<NYql::NDq::IDqAsyncLookupSource*, NActors::IActor*> CreateHttpLookupSourcePair(
     Ydb::Dq::HttpLookup::TDqHttpLookupSourceSettings settings,
-    NActors::TActorId egressActorId,
     NActors::TActorId resultTarget,
     IDqAsyncIoFactory::TLookupSourceArguments&& args)
 {
-    // Create the receiver actor.
-    // The receiver is both the IDqAsyncLookupSource collaborator and the NActors::IActor.
+    // Build egress security config from lookup source settings.
+    TEgressSecurityConfig securityConfig;
+    if (settings.has_egress_settings()) {
+        const auto& egressSettings = settings.egress_settings();
+        for (const auto& host : egressSettings.allowed_hosts()) {
+            securityConfig.AllowedHosts.insert(host);
+        }
+        for (const auto& host : egressSettings.denied_hosts()) {
+            securityConfig.DeniedHosts.insert(host);
+        }
+        if (egressSettings.max_request_body_size()) {
+            securityConfig.MaxRequestBodySize = egressSettings.max_request_body_size();
+        }
+        if (egressSettings.max_response_body_size()) {
+            securityConfig.MaxResponseBodySize = egressSettings.max_response_body_size();
+        }
+        if (egressSettings.max_in_flight_requests()) {
+            securityConfig.MaxInFlightRequests = egressSettings.max_in_flight_requests();
+        }
+        if (egressSettings.max_in_flight_requests_per_host()) {
+            securityConfig.MaxInFlightRequestsPerHost =
+                egressSettings.max_in_flight_requests_per_host();
+        }
+    }
+
+    // Create the receiver actor (heap-allocated).
+    // The egress actor will be created by the receiver during Bootstrap.
     //
     // KNOWN LIMITATION: IMemoryQuotaManager is passed as nullptr because
     // TLookupSourceArguments does not include a MemoryQuotaManager field
     // (only TSourceArguments does, see dq_compute_actor_async_io.h:271).
     // This means response body bytes are NOT accounted against the memory quota.
-    //
-    // TO FIX: Extend TLookupSourceArguments with IMemoryQuotaManager::TPtr field,
-    // wire it from the compute actor, and pass it here instead of nullptr.
-    auto receiver = args.ParentId.NewChild<THttpLookupReceiver>(
-        egressActorId,
+    auto* receiver = new THttpLookupReceiver(
         resultTarget,
         Ydb::Dq::HttpLookup::TDqHttpLookupSourceSettings(settings),
+        std::move(securityConfig),
         nullptr,  // IMemoryQuotaManager — not in TLookupSourceArguments (see NOTE above)
         args.SecureParams,
         args.Alloc,

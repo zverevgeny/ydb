@@ -160,7 +160,7 @@ void THttpEgressActor::HandleHttpIncomingResponse(NHttp::TEvHttpProxy::TEvHttpIn
     delete pending;
 }
 
-void THttpEgressActor::HandleWakeup(NActors::TEvents::TEvWakeup::TPtr& ev, const NActors::TActorContext& ctx) {
+void THttpEgressActor::HandleWakeup(NActors::TEvents::TEvWakeup::TPtr& ev, const NActors::TActorContext& /* ctx */) {
     // O(1) lookup: the cookie is passed as the wakeup Tag.
     ui64 cookie = ev->Get()->Tag;
     auto it = PendingRequests.find(cookie);

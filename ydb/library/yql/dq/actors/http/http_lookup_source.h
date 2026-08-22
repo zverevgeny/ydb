@@ -3,7 +3,7 @@
 #include "events.h"
 #include "http_egress_actor.h"
 #include "lookup_events.h"
-#include "proto/http_lookup.pb.h"
+#include <ydb/library/yql/dq/proto/http_lookup.pb.h>
 
 #include <ydb/library/yql/dq/actors/compute/dq_compute_actor_async_io.h>
 #include <ydb/library/actors/core/actor_bootstrapped.h>
@@ -34,14 +34,16 @@ struct TLookupResponse {
 class THttpLookupReceiver : public NActors::TActorBootstrapped<THttpLookupReceiver> {
 public:
     THttpLookupReceiver(
-        NActors::TActorId egressActorId,
         NActors::TActorId resultTarget,
         Ydb::Dq::HttpLookup::TDqHttpLookupSourceSettings settings,
+        TEgressSecurityConfig securityConfig,
         IMemoryQuotaManager::TPtr memoryQuotaManager,
         const THashMap<TString, TString>& secureParams,
         std::shared_ptr<NKikimr::NMiniKQL::TScopedAlloc> alloc,
         const NKikimr::NMiniKQL::TStructType* payloadType,
         const NKikimr::NMiniKQL::THolderFactory& holderFactory);
+
+    void Bootstrap(const NActors::TActorContext& ctx);
 
 private:
     STFUNC(StateFunc);
@@ -52,7 +54,9 @@ private:
     void HandleWakeup(NActors::TEvents::TEvWakeup::TPtr& ev, const NActors::TActorContext& ctx);
 
     // Process a single lookup request batch.
-    void ProcessLookup(std::shared_ptr<IDqAsyncLookupSource::TUnboxedValueMap> request);
+    void ProcessLookup(
+        std::shared_ptr<NYql::NDq::IDqAsyncLookupSource::TUnboxedValueMap> request,
+        const NActors::TActorContext& ctx);
 
     // Build HTTP URL from key using path template.
     TString BuildUrl(TStringBuf key) const;
@@ -84,8 +88,11 @@ private:
     // Settings from proto.
     const Ydb::Dq::HttpLookup::TDqHttpLookupSourceSettings Settings;
 
-    // Egress actor for making HTTP requests.
-    const NActors::TActorId EgressActorId;
+    // Security config for egress actor.
+    const TEgressSecurityConfig SecurityConfig;
+
+    // Egress actor for making HTTP requests (created during Bootstrap).
+    NActors::TActorId EgressActorId;
 
     // Target actor to send TEvLookupResult to.
     const NActors::TActorId ResultTarget;
@@ -113,7 +120,7 @@ private:
     THashMap<TString, TLookupResponse> CompletedResponses;
 
     // Original request keys in order (for result assembly).
-    std::shared_ptr<IDqAsyncLookupSource::TUnboxedValueMap> CurrentRequest;
+    std::shared_ptr<NYql::NDq::IDqAsyncLookupSource::TUnboxedValueMap> CurrentRequest;
 
     // Cache: key → response (for CACHE_ACROSS_BATCHES).
     // Uses TVector for access-order tracking (simple LRU).
@@ -132,13 +139,13 @@ private:
 // THttpLookupSource implements IDqAsyncLookupSource for HTTP-based lookups.
 // It is paired with a THttpLookupReceiver actor. The source initiates lookups
 // by sending the request to the receiver actor, which handles the async HTTP flow.
-class THttpLookupSource : public IDqAsyncLookupSource {
+class THttpLookupSource : public NYql::NDq::IDqAsyncLookupSource {
 public:
     THttpLookupSource(
         Ydb::Dq::HttpLookup::TDqHttpLookupSourceSettings settings,
-        NActors::TActorId receiverActorId);
+        NActors::IActor* receiverActor);
 
-    // IDqAsyncLookupSource interface
+    // NYql::NDq::IDqAsyncLookupSource interface
     size_t GetMaxSupportedKeysInRequest() const override;
     void AsyncLookup(std::weak_ptr<TUnboxedValueMap> request) override;
 
@@ -150,14 +157,13 @@ private:
     const Ydb::Dq::HttpLookup::TDqHttpLookupSourceSettings Settings;
 
     // Paired receiver actor that handles the async HTTP flow.
-    NActors::TActorId ReceiverActorId;
+    NActors::IActor* ReceiverActor;
 };
 
 // Factory function to create the lookup source and paired receiver actor.
-// Takes the egress actor ID explicitly (created by the caller).
-std::pair<IDqAsyncLookupSource*, NActors::IActor*> CreateHttpLookupSourcePair(
+// The receiver actor creates the egress actor during Bootstrap.
+std::pair<NYql::NDq::IDqAsyncLookupSource*, NActors::IActor*> CreateHttpLookupSourcePair(
     Ydb::Dq::HttpLookup::TDqHttpLookupSourceSettings settings,
-    NActors::TActorId egressActorId,
     NActors::TActorId resultTarget,
     IDqAsyncIoFactory::TLookupSourceArguments&& args);
 

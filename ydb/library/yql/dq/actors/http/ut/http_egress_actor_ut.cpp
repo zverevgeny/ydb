@@ -1003,7 +1003,7 @@ Y_UNIT_TEST(TestRealRequestTimeoutThroughActor) {
     NHttp::THeadersBuilder headers;
     TString url = "http://localhost:" + ToString(port) + "/slow";
     actorSystem.Send(new NActors::IEventHandle(egressId, tester,
-        new TEvHttpEgress::TEvHttpRequest(1, "GET", url, headers, "", TDuration::Milliseconds(100), tester)),
+        new TEvHttpEgress::TEvHttpRequest(1, "GET", url, headers, "", TDuration::MilliSeconds(100), tester)),
         0, true);
 
     // The proxy receives the incoming request — but we don't respond.
@@ -1012,7 +1012,7 @@ Y_UNIT_TEST(TestRealRequestTimeoutThroughActor) {
     UNIT_ASSERT(incomingRequest);
 
     // Wait for the timeout to fire by sleeping and dispatching.
-    ::Sleep(TDuration::Milliseconds(200));
+    ::Sleep(TDuration::MilliSeconds(200));
     actorSystem.DispatchEvents();
 
     // The egress actor should send a timeout error.
