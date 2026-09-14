@@ -1,5 +1,10 @@
 #include "yql_generic_match_predicate.h"
 
+#include <cmath>
+#include <cstring>
+
+#include <util/generic/ylimits.h>
+
 namespace NYql::NGenericPushDown {
 
     namespace {
@@ -91,6 +96,204 @@ namespace NYql::NGenericPushDown {
             }
         }
 
+        bool IsIntegerTypeId(Ydb::Type::PrimitiveTypeId typeId) {
+            switch (typeId) {
+                case Ydb::Type::INT8:
+                case Ydb::Type::INT16:
+                case Ydb::Type::INT32:
+                case Ydb::Type::INT64:
+                case Ydb::Type::UINT8:
+                case Ydb::Type::UINT16:
+                case Ydb::Type::UINT32:
+                case Ydb::Type::UINT64:
+                    return true;
+                default:
+                    return false;
+            }
+        }
+
+        bool IsFloatingTypeId(Ydb::Type::PrimitiveTypeId typeId) {
+            return typeId == Ydb::Type::FLOAT || typeId == Ydb::Type::DOUBLE;
+        }
+
+        TMaybe<i64> TypedValueToInt64(const Ydb::TypedValue& value) {
+            if (!value.type().has_type_id() || !IsIntegerTypeId(value.type().type_id())) {
+                return {};
+            }
+            switch (value.type().type_id()) {
+                case Ydb::Type::INT8:
+                case Ydb::Type::INT16:
+                case Ydb::Type::INT32:
+                    return value.value().int32_value();
+                case Ydb::Type::INT64:
+                    return value.value().int64_value();
+                case Ydb::Type::UINT8:
+                case Ydb::Type::UINT16:
+                case Ydb::Type::UINT32:
+                    return static_cast<i64>(value.value().uint32_value());
+                case Ydb::Type::UINT64: {
+                    const ui64 raw = value.value().uint64_value();
+                    if (raw > static_cast<ui64>(Max<i64>())) {
+                        return {};
+                    }
+                    return static_cast<i64>(raw);
+                }
+                default:
+                    return {};
+            }
+        }
+
+        TMaybe<double> TypedValueToDouble(const Ydb::TypedValue& value) {
+            if (!value.type().has_type_id() || !IsFloatingTypeId(value.type().type_id())) {
+                return {};
+            }
+            if (value.type().type_id() == Ydb::Type::FLOAT) {
+                return value.value().float_value();
+            }
+            return value.value().double_value();
+        }
+
+        TMaybe<bool> TypedValueToBool(const Ydb::TypedValue& value) {
+            if (!value.type().has_type_id() || value.type().type_id() != Ydb::Type::BOOL) {
+                return {};
+            }
+            return value.value().bool_value();
+        }
+
+        TMaybe<TString> TypedValueToUuidBytes(const Ydb::TypedValue& value) {
+            if (!value.type().has_type_id() || value.type().type_id() != Ydb::Type::UUID) {
+                return {};
+            }
+            TString bytes;
+            bytes.resize(16);
+            const ui64 low = value.value().low_128();
+            const ui64 high = value.value().high_128();
+            // Byte-by-byte copy to avoid endianness issues.
+            // low_128 = bytes 0..7, high_128 = bytes 8..15 (little-endian interpretation).
+            for (int i = 0; i < 8; ++i) {
+                bytes[i] = static_cast<char>(low >> (8 * i));
+                bytes[8 + i] = static_cast<char>(high >> (8 * i));
+            }
+            return bytes;
+        }
+
+        ::NYql::NConnector::NApi::TPredicate::TComparison::EOperation SwapComparison(
+            ::NYql::NConnector::NApi::TPredicate::TComparison::EOperation operation
+        ) {
+            using TComparison = ::NYql::NConnector::NApi::TPredicate::TComparison;
+            switch (operation) {
+                case TComparison::LE:
+                    return TComparison::GE;
+                case TComparison::L:
+                    return TComparison::G;
+                case TComparison::GE:
+                    return TComparison::LE;
+                case TComparison::G:
+                    return TComparison::L;
+                default:
+                    return operation;
+            }
+        }
+
+        template <typename T>
+        Triple CompareMinMax(T lo, T hi, ::NYql::NConnector::NApi::TPredicate::TComparison::EOperation operation, T c) {
+            using TComparison = ::NYql::NConnector::NApi::TPredicate::TComparison;
+            switch (operation) {
+                case TComparison::EQ:
+                    return lo <= c && c <= hi ? Triple::True : Triple::False;
+                case TComparison::NE:
+                    return (lo == hi && lo == c) ? Triple::False : Triple::True;
+                case TComparison::LE:
+                    return lo <= c ? Triple::True : Triple::False;
+                case TComparison::L:
+                    return lo < c ? Triple::True : Triple::False;
+                case TComparison::GE:
+                    return c <= hi ? Triple::True : Triple::False;
+                case TComparison::G:
+                    return c < hi ? Triple::True : Triple::False;
+                case TComparison::IND:
+                case TComparison::ID:
+                case TComparison::STARTS_WITH:
+                case TComparison::ENDS_WITH:
+                case TComparison::CONTAINS:
+                case TComparison::COMPARISON_OPERATION_UNSPECIFIED:
+                case ::NYql::NConnector::NApi::TPredicate_TComparison_EOperation_TPredicate_TComparison_EOperation_INT_MIN_SENTINEL_DO_NOT_USE_:
+                case ::NYql::NConnector::NApi::TPredicate_TComparison_EOperation_TPredicate_TComparison_EOperation_INT_MAX_SENTINEL_DO_NOT_USE_:
+                    return Triple::Unknown;
+            }
+            return Triple::Unknown;
+        }
+
+        Triple CompareLongStats(const TMaybe<TColumnStatistics>& statistics, ::NYql::NConnector::NApi::TPredicate::TComparison::EOperation operation, const Ydb::TypedValue& typedValue) {
+            if (!statistics || !statistics->LongStats || !statistics->LongStats->lowValue || !statistics->LongStats->highValue) {
+                return Triple::Unknown;
+            }
+            const auto constant = TypedValueToInt64(typedValue);
+            if (!constant) {
+                return Triple::Unknown;
+            }
+            return CompareMinMax(*statistics->LongStats->lowValue, *statistics->LongStats->highValue, operation, *constant);
+        }
+
+        Triple CompareDoubleStats(const TMaybe<TColumnStatistics>& statistics, ::NYql::NConnector::NApi::TPredicate::TComparison::EOperation operation, const Ydb::TypedValue& typedValue) {
+            if (!statistics || !statistics->DoubleStats || !statistics->DoubleStats->lowValue || !statistics->DoubleStats->highValue) {
+                return Triple::Unknown;
+            }
+            if (std::isnan(*statistics->DoubleStats->lowValue) || std::isnan(*statistics->DoubleStats->highValue)) {
+                return Triple::Unknown;
+            }
+            const auto constant = TypedValueToDouble(typedValue);
+            if (!constant || std::isnan(*constant)) {
+                return Triple::Unknown;
+            }
+            return CompareMinMax(*statistics->DoubleStats->lowValue, *statistics->DoubleStats->highValue, operation, *constant);
+        }
+
+        Triple CompareBooleanStats(const TMaybe<TColumnStatistics>& statistics, ::NYql::NConnector::NApi::TPredicate::TComparison::EOperation operation, const Ydb::TypedValue& typedValue) {
+            if (!statistics || !statistics->BooleanStats) {
+                return Triple::Unknown;
+            }
+            const auto constant = TypedValueToBool(typedValue);
+            if (!constant) {
+                return Triple::Unknown;
+            }
+            using TComparison = ::NYql::NConnector::NApi::TPredicate::TComparison;
+            const auto& boolStats = *statistics->BooleanStats;
+            if (!boolStats.numTrues || !boolStats.numFalses) {
+                return Triple::Unknown;
+            }
+            const bool hasTrue = *boolStats.numTrues > 0;
+            const bool hasFalse = *boolStats.numFalses > 0;
+            switch (operation) {
+                case TComparison::EQ:
+                    if (*constant) {
+                        return hasTrue ? Triple::True : Triple::False;
+                    }
+                    return hasFalse ? Triple::True : Triple::False;
+                case TComparison::NE:
+                    if (*constant) {
+                        return hasFalse ? Triple::True : Triple::False;
+                    }
+                    return hasTrue ? Triple::True : Triple::False;
+                default:
+                    return Triple::Unknown;
+            }
+        }
+
+        Triple CompareUuidStats(const TMaybe<TColumnStatistics>& statistics, ::NYql::NConnector::NApi::TPredicate::TComparison::EOperation operation, const Ydb::TypedValue& typedValue) {
+            if (!statistics || !statistics->UuidStats || !statistics->UuidStats->lowValue || !statistics->UuidStats->highValue) {
+                return Triple::Unknown;
+            }
+            if (statistics->UuidStats->lowValue->size() != 16 || statistics->UuidStats->highValue->size() != 16) {
+                return Triple::Unknown;
+            }
+            const auto constant = TypedValueToUuidBytes(typedValue);
+            if (!constant || constant->size() != 16) {
+                return Triple::Unknown;
+            }
+            return CompareMinMax(*statistics->UuidStats->lowValue, *statistics->UuidStats->highValue, operation, *constant);
+        }
+
         Triple BetweenTimestamp(const TMaybe<TColumnStatistics>& statistics, const Ydb::TypedValue& least, const Ydb::TypedValue& greatest, int64_t multiplier) {
             if (!statistics || !statistics->Timestamp || !statistics->Timestamp->lowValue || !statistics->Timestamp->highValue) {
                 return Triple::Unknown;
@@ -107,6 +310,9 @@ namespace NYql::NGenericPushDown {
             }
             auto leastTimestamp = TInstant::FromValue(least.value().int64_value() * multiplier);
             auto greatestTimestamp = TInstant::FromValue(greatest.value().int64_value() * multiplier);
+            if (leastTimestamp > greatestTimestamp) {
+                return Triple::False;
+            }
             return timestampStatistics.lowValue <= greatestTimestamp && timestampStatistics.highValue >= leastTimestamp ? Triple::True : Triple::False;
         }
 
@@ -217,7 +423,65 @@ namespace NYql::NGenericPushDown {
                     return BetweenTimestamp(statistics, least, greatest, 1000000);
                 case Ydb::Type::DATE:
                     return BetweenTimestamp(statistics, least, greatest, 24 * 3600 * 1000000LL);
-                // TODO: other types
+                case Ydb::Type::INT8:
+                case Ydb::Type::INT16:
+                case Ydb::Type::INT32:
+                case Ydb::Type::INT64:
+                case Ydb::Type::UINT8:
+                case Ydb::Type::UINT16:
+                case Ydb::Type::UINT32:
+                case Ydb::Type::UINT64: {
+                    if (!statistics.LongStats || !statistics.LongStats->lowValue || !statistics.LongStats->highValue) {
+                        return Triple::Unknown;
+                    }
+                    const auto leastInt = TypedValueToInt64(least);
+                    const auto greatestInt = TypedValueToInt64(greatest);
+                    if (!leastInt || !greatestInt) {
+                        return Triple::Unknown;
+                    }
+                    if (*leastInt > *greatestInt) {
+                        return Triple::False;
+                    }
+                    return *statistics.LongStats->lowValue <= *greatestInt && *statistics.LongStats->highValue >= *leastInt
+                        ? Triple::True
+                        : Triple::False;
+                }
+                case Ydb::Type::FLOAT:
+                case Ydb::Type::DOUBLE: {
+                    if (!statistics.DoubleStats || !statistics.DoubleStats->lowValue || !statistics.DoubleStats->highValue) {
+                        return Triple::Unknown;
+                    }
+                    if (std::isnan(*statistics.DoubleStats->lowValue) || std::isnan(*statistics.DoubleStats->highValue)) {
+                        return Triple::Unknown;
+                    }
+                    const auto leastDouble = TypedValueToDouble(least);
+                    const auto greatestDouble = TypedValueToDouble(greatest);
+                    if (!leastDouble || !greatestDouble || std::isnan(*leastDouble) || std::isnan(*greatestDouble)) {
+                        return Triple::Unknown;
+                    }
+                    if (*leastDouble > *greatestDouble) {
+                        return Triple::False;
+                    }
+                    return *statistics.DoubleStats->lowValue <= *greatestDouble && *statistics.DoubleStats->highValue >= *leastDouble
+                        ? Triple::True
+                        : Triple::False;
+                }
+                case Ydb::Type::UUID: {
+                    if (!statistics.UuidStats || !statistics.UuidStats->lowValue || !statistics.UuidStats->highValue) {
+                        return Triple::Unknown;
+                    }
+                    const auto leastUuid = TypedValueToUuidBytes(least);
+                    const auto greatestUuid = TypedValueToUuidBytes(greatest);
+                    if (!leastUuid || !greatestUuid) {
+                        return Triple::Unknown;
+                    }
+                    if (*leastUuid > *greatestUuid) {
+                        return Triple::False;
+                    }
+                    return *statistics.UuidStats->lowValue <= *greatestUuid && *statistics.UuidStats->highValue >= *leastUuid
+                        ? Triple::True
+                        : Triple::False;
+                }
                 default:
                     return Triple::Unknown;
             }
@@ -231,7 +495,22 @@ namespace NYql::NGenericPushDown {
                     return ComparatorTimestamp(lValue, operation, rValue, 1000000);
                 case Ydb::Type::DATE:
                     return ComparatorTimestamp(lValue, operation, rValue, 24 * 3600 * 1000000LL);
-                // TODO: other types
+                case Ydb::Type::INT8:
+                case Ydb::Type::INT16:
+                case Ydb::Type::INT32:
+                case Ydb::Type::INT64:
+                case Ydb::Type::UINT8:
+                case Ydb::Type::UINT16:
+                case Ydb::Type::UINT32:
+                case Ydb::Type::UINT64:
+                    return CompareLongStats(rValue, SwapComparison(operation), lValue);
+                case Ydb::Type::FLOAT:
+                case Ydb::Type::DOUBLE:
+                    return CompareDoubleStats(rValue, SwapComparison(operation), lValue);
+                case Ydb::Type::BOOL:
+                    return CompareBooleanStats(rValue, SwapComparison(operation), lValue);
+                case Ydb::Type::UUID:
+                    return CompareUuidStats(rValue, SwapComparison(operation), lValue);
                 default:
                     return Triple::Unknown;
             }
@@ -245,7 +524,22 @@ namespace NYql::NGenericPushDown {
                     return ComparatorTimestamp(lValue, operation, rValue, 1000000);
                 case Ydb::Type::DATE:
                     return ComparatorTimestamp(lValue, operation, rValue, 24 * 3600 * 1000000LL);
-                // TODO: other types
+                case Ydb::Type::INT8:
+                case Ydb::Type::INT16:
+                case Ydb::Type::INT32:
+                case Ydb::Type::INT64:
+                case Ydb::Type::UINT8:
+                case Ydb::Type::UINT16:
+                case Ydb::Type::UINT32:
+                case Ydb::Type::UINT64:
+                    return CompareLongStats(lValue, operation, rValue);
+                case Ydb::Type::FLOAT:
+                case Ydb::Type::DOUBLE:
+                    return CompareDoubleStats(lValue, operation, rValue);
+                case Ydb::Type::BOOL:
+                    return CompareBooleanStats(lValue, operation, rValue);
+                case Ydb::Type::UUID:
+                    return CompareUuidStats(lValue, operation, rValue);
                 default:
                     return Triple::Unknown;
             }

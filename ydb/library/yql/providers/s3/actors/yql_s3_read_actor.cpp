@@ -814,10 +814,14 @@ public:
                 }
             }
 
+            auto fileRowGroup = [&](ui64 index) -> int {
+                return hasPredicate ? static_cast<int>(matchedRowGroups[index]) : static_cast<int>(index);
+            };
+
             for (ui64 i = 0; i < readerCount; i++) {
                 if (!columnIndices.empty()) {
                     CurrentRowGroupIndex = i;
-                    ThrowParquetNotOk(readers[i]->WillNeedRowGroups({ hasPredicate ? static_cast<int>(matchedRowGroups[i]) : static_cast<int>(i) }, columnIndices));
+                    ThrowParquetNotOk(readers[i]->WillNeedRowGroups({ fileRowGroup(i) }, columnIndices));
                     SourceContext->IncChunkCount();
                 }
                 RowGroupReaderIndex[i] = i;
@@ -865,7 +869,7 @@ public:
                 {
                     StartUnit();
                     Y_DEFER { StopUnit(); };
-                    ThrowParquetNotOk(readers[readyReaderIndex]->DecodeRowGroups({ hasPredicate ? static_cast<int>(matchedRowGroups[readyGroupIndex]) : static_cast<int>(readyGroupIndex) }, columnIndices, &table));
+                    ThrowParquetNotOk(readers[readyReaderIndex]->DecodeRowGroups({ fileRowGroup(readyGroupIndex) }, columnIndices, &table));
                 }
                 readyGroupCount++;
 
@@ -904,7 +908,7 @@ public:
                 if (nextGroup < numGroups) {
                     if (!columnIndices.empty()) {
                         CurrentRowGroupIndex = nextGroup;
-                        ThrowParquetNotOk(readers[readyReaderIndex]->WillNeedRowGroups({ hasPredicate ? static_cast<int>(nextGroup) : static_cast<int>(nextGroup) }, columnIndices));
+                        ThrowParquetNotOk(readers[readyReaderIndex]->WillNeedRowGroups({ fileRowGroup(nextGroup) }, columnIndices));
                         SourceContext->IncChunkCount();
                     }
                     RowGroupReaderIndex[nextGroup] = readyReaderIndex;
@@ -947,7 +951,14 @@ public:
 
         BuildColumnConverters(ReadSpec->ArrowSchema, schema, columnIndices, columnConverters, ReadSpec->RowSpec, ReadSpec->Settings);
 
-        for (int group = 0; group < fileReader->num_row_groups(); group++) {
+        const bool hasPredicate = ReadSpec->Predicate.payload_case() != NYql::NConnector::NApi::TPredicate::PayloadCase::PAYLOAD_NOT_SET;
+        const TVector<ui64> matchedRowGroups = hasPredicate
+            ? MatchedRowGroups(fileReader->parquet_reader()->metadata(), ReadSpec->Predicate)
+            : TVector<ui64>();
+        const int numGroups = hasPredicate ? static_cast<int>(matchedRowGroups.size()) : fileReader->num_row_groups();
+
+        for (int matchedIndex = 0; matchedIndex < numGroups; matchedIndex++) {
+            const int group = hasPredicate ? static_cast<int>(matchedRowGroups[matchedIndex]) : matchedIndex;
 
             if (IsPaused()) {
                 CpuTime += GetCpuTimeDelta();

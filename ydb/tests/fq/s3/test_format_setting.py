@@ -21,6 +21,7 @@ import ydb.tests.fq.s3.s3_helpers as s3_helpers
 
 from datetime import datetime
 from google.protobuf import struct_pb2
+import struct
 
 
 class TestS3(TestYdsBase):
@@ -2395,3 +2396,208 @@ Pear;15;33'''
         with_predicate_ingress_bytes = int(stat[graph_name]["IngressBytes"]["sum"])
 
         assert without_predicate_ingress_bytes > with_predicate_ingress_bytes, stat
+
+    def _yql_uuid_bytes(self, uuid_str):
+        hex_str = uuid_str.replace('-', '')
+        dw = [int(hex_str[i : i + 4], 16) for i in range(0, 32, 4)]
+        dw[0], dw[1] = dw[1], dw[0]
+        for i in range(4, 8):
+            dw[i] = ((dw[i] >> 8) & 0xFF) | ((dw[i] & 0xFF) << 8)
+        return struct.pack('<8H', *dw)
+
+    def _assert_pushdown_saves_io(self, client, sql, expected_rows):
+        query_id = client.create_query("simple", sql, type=fq.QueryContent.QueryType.ANALYTICS).result.query_id
+        client.wait_query_status(query_id, fq.QueryMeta.COMPLETED)
+        data = client.get_result_data(query_id, limit=50)
+        rows_without = [(row.items[0].text_value, row.items[1].text_value) for row in data.result.result_set.rows]
+        assert sorted(rows_without) == sorted(expected_rows), rows_without
+        stat = json.loads(client.describe_query(query_id).result.query.statistics.json)
+        without_predicate_ingress_bytes = int(stat["ResultSet"]["IngressBytes"]["sum"])
+
+        sql_with_pushdown = 'pragma s3.UsePredicatePushdown = "true";\n' + sql
+        query_id = client.create_query("simple", sql_with_pushdown, type=fq.QueryContent.QueryType.ANALYTICS).result.query_id
+        client.wait_query_status(query_id, fq.QueryMeta.COMPLETED)
+        data = client.get_result_data(query_id, limit=50)
+        rows_with = [(row.items[0].text_value, row.items[1].text_value) for row in data.result.result_set.rows]
+        assert sorted(rows_with) == sorted(expected_rows), rows_with
+        stat = json.loads(client.describe_query(query_id).result.query.statistics.json)
+        with_predicate_ingress_bytes = int(stat["ResultSet"]["IngressBytes"]["sum"])
+        assert without_predicate_ingress_bytes > with_predicate_ingress_bytes, stat
+
+    @yq_v2
+    def test_s3_push_down_parquet_noncontiguous_row_groups(self, kikimr, s3, client, unique_prefix):
+        big = "x" * 100000
+        data = [
+            [
+                int(datetime.fromisoformat("2024-06-14 00:00:00+00:00").timestamp() * 1000),
+                int(datetime.fromisoformat("2024-06-14 01:00:00+00:00").timestamp() * 1000),
+                int(datetime.fromisoformat("2024-06-16 00:00:00+00:00").timestamp() * 1000),
+                int(datetime.fromisoformat("2024-06-16 01:00:00+00:00").timestamp() * 1000),
+                int(datetime.fromisoformat("2024-06-14 02:00:00+00:00").timestamp() * 1000),
+                int(datetime.fromisoformat("2024-06-14 03:00:00+00:00").timestamp() * 1000),
+            ],
+            ["apple", "banana", big, big, "pear", "melon"],
+        ]
+        schema = pa.schema([('ts', pa.timestamp('ms')), ('fruit', pa.string())])
+        table = pa.Table.from_arrays(data, schema=schema)
+        filename = 'test_s3_push_down_parquet_noncontiguous.parquet'
+        pq.write_table(table, yatest.common.work_path(filename), row_group_size=2)
+        s3_helpers.create_bucket_and_upload_file(filename, s3.s3_url, "fbucket", yatest.common.work_path())
+
+        kikimr.control_plane.wait_bootstrap(1)
+        storage_connection_name = unique_prefix + "hcpp_nc"
+        client.create_storage_connection(storage_connection_name, "fbucket")
+
+        sql = f'''
+            SELECT
+                `fruit`, CAST(`ts` as Utf8)
+            FROM
+                `{storage_connection_name}`.`/{filename}`
+            WITH (FORMAT="parquet",
+                SCHEMA=(
+                  `ts` Timestamp NOT NULL,
+                  `fruit` Utf8 NOT NULL
+                ))
+            WHERE Timestamp("2024-06-14T00:00:00Z") <= ts and ts < Timestamp("2024-06-15T00:00:00Z")
+            '''
+        self._assert_pushdown_saves_io(
+            client,
+            sql,
+            [
+                ("apple", "2024-06-14T00:00:00Z"),
+                ("banana", "2024-06-14T01:00:00Z"),
+                ("pear", "2024-06-14T02:00:00Z"),
+                ("melon", "2024-06-14T03:00:00Z"),
+            ],
+        )
+
+    @yq_v2
+    def test_s3_push_down_parquet_int(self, kikimr, s3, client, unique_prefix):
+        big = "x" * 100000
+        data = [
+            [1, 2, 100, 200, 3, 4],
+            [big, big, "keep-a", "keep-b", big, big],
+        ]
+        schema = pa.schema([('price', pa.int32()), ('fruit', pa.string())])
+        table = pa.Table.from_arrays(data, schema=schema)
+        filename = 'test_s3_push_down_parquet_int.parquet'
+        pq.write_table(table, yatest.common.work_path(filename), row_group_size=2)
+        s3_helpers.create_bucket_and_upload_file(filename, s3.s3_url, "fbucket", yatest.common.work_path())
+
+        kikimr.control_plane.wait_bootstrap(1)
+        storage_connection_name = unique_prefix + "hcpp_int"
+        client.create_storage_connection(storage_connection_name, "fbucket")
+
+        sql = f'''
+            SELECT
+                `fruit`, CAST(`price` as Utf8)
+            FROM
+                `{storage_connection_name}`.`/{filename}`
+            WITH (FORMAT="parquet",
+                SCHEMA=(
+                  `price` Int32 NOT NULL,
+                  `fruit` Utf8 NOT NULL
+                ))
+            WHERE price >= 15
+            '''
+        self._assert_pushdown_saves_io(
+            client,
+            sql,
+            [
+                ("keep-a", "100"),
+                ("keep-b", "200"),
+            ],
+        )
+
+        sql_all = f'''
+            SELECT
+                `fruit`
+            FROM
+                `{storage_connection_name}`.`/{filename}`
+            WITH (FORMAT="parquet",
+                SCHEMA=(
+                  `price` Int32 NOT NULL,
+                  `fruit` Utf8 NOT NULL
+                ))
+            WHERE price >= 0
+            '''
+        query_id = client.create_query("simple", sql_all, type=fq.QueryContent.QueryType.ANALYTICS).result.query_id
+        client.wait_query_status(query_id, fq.QueryMeta.COMPLETED)
+        fruits_without = sorted(row.items[0].text_value for row in client.get_result_data(query_id, limit=50).result.result_set.rows)
+        query_id = client.create_query(
+            "simple", 'pragma s3.UsePredicatePushdown = "true";\n' + sql_all, type=fq.QueryContent.QueryType.ANALYTICS
+        ).result.query_id
+        client.wait_query_status(query_id, fq.QueryMeta.COMPLETED)
+        fruits_with = sorted(row.items[0].text_value for row in client.get_result_data(query_id, limit=50).result.result_set.rows)
+        assert fruits_without == fruits_with
+        assert len(fruits_without) == 6
+
+    @yq_v2
+    def test_s3_push_down_parquet_uuid(self, kikimr, s3, client, unique_prefix):
+        uuid_a = "11111111-1111-4111-8111-111111111111"
+        uuid_b = "22222222-2222-4222-8222-222222222222"
+        uuid_c = "33333333-3333-4333-8333-333333333333"
+        uuid_miss = "44444444-4444-4444-8444-444444444444"
+        big = "x" * 100000
+        data = [
+            [
+                self._yql_uuid_bytes(uuid_a),
+                self._yql_uuid_bytes(uuid_a),
+                self._yql_uuid_bytes(uuid_b),
+                self._yql_uuid_bytes(uuid_b),
+                self._yql_uuid_bytes(uuid_c),
+                self._yql_uuid_bytes(uuid_c),
+            ],
+            ["a1", "a2", big, big, "c1", "c2"],
+        ]
+        schema = pa.schema([('id', pa.binary(16)), ('fruit', pa.string())])
+        table = pa.Table.from_arrays(data, schema=schema)
+        filename = 'test_s3_push_down_parquet_uuid.parquet'
+        pq.write_table(table, yatest.common.work_path(filename), row_group_size=2)
+        s3_helpers.create_bucket_and_upload_file(filename, s3.s3_url, "fbucket", yatest.common.work_path())
+
+        kikimr.control_plane.wait_bootstrap(1)
+        storage_connection_name = unique_prefix + "hcpp_uuid"
+        client.create_storage_connection(storage_connection_name, "fbucket")
+
+        sql = f'''
+            SELECT
+                `fruit`, CAST(`id` as Utf8)
+            FROM
+                `{storage_connection_name}`.`/{filename}`
+            WITH (FORMAT="parquet",
+                SCHEMA=(
+                  `id` Uuid NOT NULL,
+                  `fruit` Utf8 NOT NULL
+                ))
+            WHERE id = Uuid("{uuid_c}")
+            '''
+        self._assert_pushdown_saves_io(
+            client,
+            sql,
+            [
+                ("c1", uuid_c),
+                ("c2", uuid_c),
+            ],
+        )
+
+        sql_miss = f'''
+            SELECT
+                `fruit`
+            FROM
+                `{storage_connection_name}`.`/{filename}`
+            WITH (FORMAT="parquet",
+                SCHEMA=(
+                  `id` Uuid NOT NULL,
+                  `fruit` Utf8 NOT NULL
+                ))
+            WHERE id = Uuid("{uuid_miss}")
+            '''
+        query_id = client.create_query("simple", sql_miss, type=fq.QueryContent.QueryType.ANALYTICS).result.query_id
+        client.wait_query_status(query_id, fq.QueryMeta.COMPLETED)
+        assert len(client.get_result_data(query_id, limit=50).result.result_set.rows) == 0
+        query_id = client.create_query(
+            "simple", 'pragma s3.UsePredicatePushdown = "true";\n' + sql_miss, type=fq.QueryContent.QueryType.ANALYTICS
+        ).result.query_id
+        client.wait_query_status(query_id, fq.QueryMeta.COMPLETED)
+        assert len(client.get_result_data(query_id, limit=50).result.result_set.rows) == 0
