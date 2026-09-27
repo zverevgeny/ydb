@@ -1415,6 +1415,75 @@ Y_UNIT_TEST_SUITE(TruncateTable) {
         }
     }
 
+    // Diagnostic for the generation boundary in TInteractionsContext: a serializable read
+    // is registered under the old InternalPathId, while a write using the same lock after
+    // TRUNCATE resolves the new InternalPathId. This test records the current CS behavior;
+    // a fix should reject the write or break the lock before its commit.
+    Y_UNIT_TEST(TruncateReadLockCanWriteNewGeneration) {
+        TTestBasicRuntime runtime;
+        SetupTruncateTestRuntime(runtime);
+        auto controllerGuard = RegisterTruncateTestController();
+        auto& controller = *controllerGuard.operator->();
+        TActorId sender = runtime.AllocateEdgeActor();
+
+        constexpr ui64 pathId = 1;
+        constexpr ui64 lockId = 77;
+        TestTableDescription testTable{};
+        Y_UNUSED(PrepareTablet(runtime, pathId, testTable.Schema));
+
+        ui64 txId = 10;
+        int writeId = 10;
+        std::vector<ui64> initialWriteIds;
+        UNIT_ASSERT(WriteData(runtime, sender, writeId++, pathId, MakeTestBlob({ 0, 1 }, testTable.Schema),
+            testTable.Schema, true, &initialWriteIds));
+        auto planStep = ProposeCommit(runtime, sender, ++txId, initialWriteIds);
+        PlanCommit(runtime, sender, planStep, txId);
+
+        const auto ssPathId = TSchemeShardLocalPathId::FromRawValue(pathId);
+        const auto* shard = WaitForShard(controller, runtime);
+        const auto oldInternalPathId = shard->GetTablesManager().ResolveInternalPathId(ssPathId, false);
+        UNIT_ASSERT(oldInternalPathId);
+
+        // Leave the serializable read lock open across TRUNCATE.
+        {
+            TShardReader reader(runtime, TTestTxConfig::TxTablet0, pathId, NOlap::TSnapshot(planStep, txId));
+            reader.SetLockId(lockId).SetReplyColumnIds(TTestSchema::ExtractIds(testTable.Schema));
+            reader.AddRange(MakeTestRange({ 0, 100 }, true, true, testTable.Pk));
+            const auto rows = reader.ReadAll();
+            UNIT_ASSERT(reader.IsCorrectlyFinished());
+            UNIT_ASSERT(rows);
+            UNIT_ASSERT_VALUES_EQUAL(rows->num_rows(), 1);
+        }
+        UNIT_ASSERT(shard->GetOperationsManager().HasReadLocks(*oldInternalPathId));
+        UNIT_ASSERT(!shard->GetOperationsManager().GetLockVerified(lockId).IsBroken());
+
+        planStep = ProposeSchemaTx(runtime, sender, TTestSchema::TruncateTableTxBody(pathId, 1), ++txId);
+        PlanSchemaTx(runtime, sender, { planStep, txId });
+
+        shard = WaitForShard(controller, runtime);
+        const auto newInternalPathId = shard->GetTablesManager().ResolveInternalPathId(ssPathId, false);
+        UNIT_ASSERT(newInternalPathId);
+        UNIT_ASSERT_UNEQUAL(*oldInternalPathId, *newInternalPathId);
+        UNIT_ASSERT(shard->GetOperationsManager().HasReadLocks(*oldInternalPathId));
+        UNIT_ASSERT(!shard->GetOperationsManager().HasReadLocks(*newInternalPathId));
+        UNIT_ASSERT(!shard->GetOperationsManager().GetLockVerified(lockId).IsBroken());
+
+        // The same lock read the old generation and now writes to the new one.
+        std::vector<ui64> writeIds;
+        UNIT_ASSERT(WriteData(runtime, sender, writeId++, pathId, MakeTestBlob({ 100, 101 }, testTable.Schema),
+            testTable.Schema, true, &writeIds, NEvWrite::EModificationType::Upsert, lockId));
+        UNIT_ASSERT(!shard->GetOperationsManager().GetLockVerified(lockId).IsBroken());
+        planStep = ProposeCommit(runtime, sender, ++txId, writeIds, lockId);
+        PlanCommit(runtime, sender, planStep, txId);
+
+        TShardReader reader(runtime, TTestTxConfig::TxTablet0, pathId, NOlap::TSnapshot(planStep, txId));
+        reader.SetReplyColumnIds(TTestSchema::ExtractIds(testTable.Schema));
+        const auto rows = reader.ReadAll();
+        UNIT_ASSERT(reader.IsCorrectlyFinished());
+        UNIT_ASSERT(rows);
+        UNIT_ASSERT_VALUES_EQUAL(rows->num_rows(), 1);
+    }
+
     Y_UNIT_TEST(TruncateInStoreTableFails) {
         TTestBasicRuntime runtime;
         TTester::Setup(runtime);

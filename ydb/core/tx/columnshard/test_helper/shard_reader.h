@@ -33,6 +33,7 @@ private:
     std::vector<TSerializedTableRange> Ranges;
     std::optional<NKikimrKqp::TEvKqpScanCursor> StartCursor;
     NKikimrKqp::TEvKqpScanCursor LastCursor;
+    std::optional<ui64> LockId;
 
     std::unique_ptr<TEvDataShard::TEvKqpScan> BuildStartEvent() const;
 
@@ -42,6 +43,12 @@ private:
     std::vector<Ydb::Issue::IssueMessage> Errors;
 
 public:
+    TShardReader& SetLockId(const ui64 lockId) {
+        AFL_VERIFY(!ScanActorId);
+        LockId = lockId;
+        return *this;
+    }
+
     ui64 GetReadStat(const TString& paramName) const {
         AFL_VERIFY(IsCorrectlyFinished());
         auto it = ResultStats.find(paramName);

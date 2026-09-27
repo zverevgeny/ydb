@@ -6,8 +6,11 @@
 
 #include <ydb/core/base/tablet_pipecache.h>
 #include <ydb/core/kqp/ut/common/columnshard.h>
+#include <ydb/core/tx/columnshard/columnshard.h>
 #include <ydb/core/tx/columnshard/hooks/testing/controller.h>
+#include <ydb/core/tx/columnshard/test_helper/columnshard_ut_common.h>
 #include <ydb/core/tx/columnshard/test_helper/controllers.h>
+#include <ydb/core/tx/tx_processing.h>
 #include <ydb/core/wrappers/fake_storage.h>
 
 #include <library/cpp/testing/unittest/registar.h>
@@ -15,6 +18,82 @@
 namespace NKikimr::NKqp {
 
 Y_UNIT_TEST_SUITE(KqpOlapLocks) {
+    Y_UNIT_TEST(TruncateBetweenReadAndWriteInSerializableTx) {
+        auto settings = TKikimrSettings().SetWithSampleTables(false);
+        settings.AppConfig.MutableTableServiceConfig()->SetEnableOlapSink(true);
+        TKikimrRunner kikimr(settings);
+        auto csController = NYDBTest::TControllers::RegisterCSControllerGuard<NYDBTest::NColumnShard::TController>();
+        auto& runtime = *kikimr.GetTestServer().GetRuntime();
+        auto client = kikimr.GetQueryClient();
+        using namespace NYdb::NQuery;
+
+        auto create = client.ExecuteQuery(R"(
+            CREATE TABLE `/Root/ColumnTable` (
+                Key Uint64 NOT NULL,
+                Value String,
+                PRIMARY KEY (Key)
+            ) WITH (STORE = COLUMN, PARTITION_COUNT = 1);
+        )", TTxControl::NoTx()).GetValueSync();
+        UNIT_ASSERT_C(create.IsSuccess(), create.GetIssues().ToString());
+
+        auto initialWrite = client.ExecuteQuery(R"(
+            UPSERT INTO `/Root/ColumnTable` (Key, Value) VALUES (1u, "before");
+        )", TTxControl::BeginTx().CommitTx()).GetValueSync();
+        UNIT_ASSERT_C(initialWrite.IsSuccess(), initialWrite.GetIssues().ToString());
+
+        auto session = client.GetSession().GetValueSync().GetSession();
+        auto read = session.ExecuteQuery(R"(
+            SELECT Key, Value FROM `/Root/ColumnTable` WHERE Key BETWEEN 1u AND 100u ORDER BY Key;
+        )", TTxControl::BeginTx(TTxSettings::SerializableRW())).GetValueSync();
+        UNIT_ASSERT_C(read.IsSuccess(), read.GetIssues().ToString());
+        CompareYson("[[1u;[\"before\"]]]", FormatResultSetYson(read.GetResultSet(0)));
+        auto tx = read.GetTransaction();
+        UNIT_ASSERT(tx && tx->IsActive());
+
+        // KQP does not yet accept TRUNCATE TABLE for column tables. Propose the same
+        // schema transaction directly to ColumnShard, while the client's transaction
+        // and its read lock remain open.
+        const auto describe = kikimr.GetTestClient().Describe(&runtime, "Root/ColumnTable");
+        const ui64 pathId = describe.GetPathId();
+        const auto shardIds = csController->GetShardActualIds();
+        UNIT_ASSERT_VALUES_EQUAL(shardIds.size(), 1);
+        const ui64 shardId = *shardIds.begin();
+        const ui64 schemaTxId = 1000000000;
+        auto sender = runtime.AllocateEdgeActor();
+        auto propose = std::make_unique<TEvColumnShard::TEvProposeTransaction>(
+            NKikimrTxColumnShard::TX_KIND_SCHEMA, describe.GetPathOwnerId(), sender, schemaTxId,
+            NTxUT::TTestSchema::TruncateTableTxBody(pathId, 1), 0, 0);
+        ForwardToTablet(runtime, shardId, sender, propose.release());
+        auto proposed = runtime.GrabEdgeEvent<TEvColumnShard::TEvProposeTransactionResult>(sender);
+        UNIT_ASSERT_C(proposed, "ColumnShard did not respond to TRUNCATE proposal");
+        UNIT_ASSERT_VALUES_EQUAL(static_cast<int>(proposed->Get()->Record.GetStatus()),
+            static_cast<int>(NKikimrTxColumnShard::PREPARED));
+
+        auto completion = std::make_unique<TEvColumnShard::TEvNotifyTxCompletion>(schemaTxId);
+        ForwardToTablet(runtime, shardId, sender, completion.release());
+        auto plan = std::make_unique<TEvTxProcessing::TEvPlanStep>(
+            proposed->Get()->Record.GetMinStep(), 0, shardId);
+        auto plannedTx = plan->Record.AddTransactions();
+        plannedTx->SetTxId(schemaTxId);
+        ActorIdToProto(sender, plannedTx->MutableAckTo());
+        ForwardToTablet(runtime, shardId, sender, plan.release());
+        UNIT_ASSERT(runtime.GrabEdgeEvent<TEvTxProcessing::TEvPlanStepAck>(sender));
+        UNIT_ASSERT(runtime.GrabEdgeEvent<TEvColumnShard::TEvNotifyTxCompletionResult>(sender));
+
+        // A serializable transaction read the old generation and now writes through
+        // the same table path. The current interaction lookup misses the old read lock.
+        auto write = session.ExecuteQuery(R"(
+            UPSERT INTO `/Root/ColumnTable` (Key, Value) VALUES (2u, "after");
+        )", TTxControl::Tx(*tx).CommitTx()).GetValueSync();
+        UNIT_ASSERT_C(write.IsSuccess(), write.GetIssues().ToString());
+
+        auto visible = client.ExecuteQuery(R"(
+            SELECT Key, Value FROM `/Root/ColumnTable` ORDER BY Key;
+        )", TTxControl::BeginTx().CommitTx()).GetValueSync();
+        UNIT_ASSERT_C(visible.IsSuccess(), visible.GetIssues().ToString());
+        CompareYson("[[2u;[\"after\"]]]", FormatResultSetYson(visible.GetResultSet(0)));
+    }
+
     Y_UNIT_TEST(TwoQueriesWithRestartTablet) {
         auto settings = TKikimrSettings().SetWithSampleTables(false);
         settings.AppConfig.MutableTableServiceConfig()->SetEnableOlapSink(true);

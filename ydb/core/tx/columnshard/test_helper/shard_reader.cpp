@@ -10,6 +10,10 @@ std::unique_ptr<NKikimr::TEvDataShard::TEvKqpScan> TShardReader::BuildStartEvent
 
     ev->Record.SetStatsMode(NYql::NDqProto::DQ_STATS_MODE_FULL);
     ev->Record.SetTxId(Snapshot.GetTxId());
+    if (LockId) {
+        ev->Record.SetLockTxId(*LockId);
+        ev->Record.SetLockNodeId(1);
+    }
 
     if (Reverse) {
         ev->Record.SetReverse(*Reverse);
