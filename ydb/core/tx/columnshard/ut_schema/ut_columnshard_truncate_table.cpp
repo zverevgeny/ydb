@@ -1593,6 +1593,119 @@ Y_UNIT_TEST_SUITE(TruncateTable) {
         }
     }
 
+    Y_UNIT_TEST(CommitOldGenerationAfterTruncatePlanIsRejected) {
+        TTestBasicRuntime runtime;
+        TTester::Setup(runtime);
+        auto csDefaultControllerGuard = NKikimr::NYDBTest::TControllers::RegisterCSControllerGuard<TDefaultTestsController>();
+        TActorId sender = runtime.AllocateEdgeActor();
+
+        const ui64 srcPathId = 1;
+        const ui64 copyPathId = 2;
+        const ui64 lockId = 3;
+        TestTableDescription testTable{};
+        Y_UNUSED(PrepareTablet(runtime, srcPathId, testTable.Schema));
+
+        ui64 txId = 10;
+        int writeId = 10;
+        std::vector<ui64> committedWriteIds;
+        UNIT_ASSERT(WriteData(
+            runtime, sender, writeId++, srcPathId, MakeTestBlob({ 0, 100 }, testTable.Schema), testTable.Schema, true, &committedWriteIds));
+        auto planStep = ProposeCommit(runtime, sender, ++txId, committedWriteIds);
+        PlanCommit(runtime, sender, planStep, txId);
+
+        planStep = ProposeSchemaTx(runtime, sender, TTestSchema::CopyTableTxBody(srcPathId, copyPathId, 1), ++txId);
+        PlanSchemaTx(runtime, sender, { planStep, txId });
+        const auto snapshotBeforeTruncate = NOlap::TSnapshot(planStep, txId);
+
+        std::vector<ui64> lockedWriteIds;
+        UNIT_ASSERT(WriteData(runtime, sender, writeId++, srcPathId, MakeTestBlob({ 100, 150 }, testTable.Schema), testTable.Schema, true,
+            &lockedWriteIds, NEvWrite::EModificationType::Upsert, lockId));
+
+        planStep = ProposeSchemaTx(runtime, sender, TTestSchema::TruncateTableTxBody(srcPathId, 1), ++txId);
+        PlanSchemaTx(runtime, sender, { planStep, txId });
+        const auto truncateSnapshot = NOlap::TSnapshot(planStep, txId);
+
+        // The live SchemeShard path now resolves to a new InternalPathId, while the accepted
+        // write in this lock still targets the old generation retained by the copy.
+        ProposeCommitFail(runtime, sender, TTestTxConfig::TxTablet0, ++txId, lockedWriteIds, lockId);
+
+        {
+            TShardReader reader(runtime, TTestTxConfig::TxTablet0, srcPathId, snapshotBeforeTruncate);
+            reader.SetReplyColumnIds(TTestSchema::ExtractIds(testTable.Schema));
+            auto rb = reader.ReadAll();
+            UNIT_ASSERT(rb);
+            UNIT_ASSERT_VALUES_EQUAL(rb->num_rows(), 100);
+            UNIT_ASSERT(!reader.IsError());
+        }
+        {
+            TShardReader reader(runtime, TTestTxConfig::TxTablet0, srcPathId, truncateSnapshot);
+            reader.SetReplyColumnIds(TTestSchema::ExtractIds(testTable.Schema));
+            UNIT_ASSERT(!reader.ReadAll());
+            UNIT_ASSERT(!reader.IsError());
+        }
+        {
+            TShardReader reader(runtime, TTestTxConfig::TxTablet0, copyPathId, truncateSnapshot);
+            reader.SetReplyColumnIds(TTestSchema::ExtractIds(testTable.Schema));
+            auto rb = reader.ReadAll();
+            UNIT_ASSERT(rb);
+            UNIT_ASSERT_VALUES_EQUAL(rb->num_rows(), 100);
+            UNIT_ASSERT(!reader.IsError());
+        }
+    }
+
+    Y_UNIT_TEST(CommitIsRejectedAfterAbortWasQueued) {
+        TTestBasicRuntime runtime;
+        TTester::Setup(runtime);
+        auto csControllerGuard = NKikimr::NYDBTest::TControllers::RegisterCSControllerGuard<TDefaultTestsController>();
+        TActorId sender = runtime.AllocateEdgeActor();
+
+        const ui64 pathId = 1;
+        const ui64 lockId = 3;
+        const ui64 commitTxId = 13;
+        TestTableDescription testTable{};
+        Y_UNUSED(PrepareTablet(runtime, pathId, testTable.Schema));
+
+        int writeId = 10;
+        std::vector<ui64> lockedWriteIds;
+        UNIT_ASSERT(WriteData(runtime, sender, writeId++, pathId, MakeTestBlob({ 0, 100 }, testTable.Schema), testTable.Schema, true,
+            &lockedWriteIds, NEvWrite::EModificationType::Upsert, lockId));
+
+        const auto createTableTxBody = [&](const ui64 auxPathId, const ui32 round) {
+            NKikimrTxColumnShard::TSchemaTxBody auxTx;
+            UNIT_ASSERT(auxTx.ParseFromString(TTestSchema::CreateTableTxBody(auxPathId, testTable.Standalone, testTable.Schema, testTable.Pk)));
+            auxTx.MutableSeqNo()->SetRound(round);
+            TString body;
+            Y_PROTOBUF_SUPPRESS_NODISCARD auxTx.SerializeToString(&body);
+            return body;
+        };
+        // The response to a schema proposal is sent after the earlier write finishes in the executor.
+        const auto barrierPlanStep = ProposeSchemaTx(runtime, sender, createTableTxBody(98, 2), 11);
+        PlanSchemaTx(runtime, sender, { barrierPlanStep, 11 });
+
+        auto* shard = WaitForShard(*csControllerGuard.operator->(), runtime);
+        auto* lockInfo = shard->GetOperationsManager().GetLockOptional(lockId);
+        UNIT_ASSERT(lockInfo);
+        // Reproduce the state after rollback has queued TAbortWriteTransaction, but before it
+        // executes. The commit proposal must not assign a TxId to this lock.
+        lockInfo->SetNeedsAborting();
+        UNIT_ASSERT(lockInfo->ReadyForAborting());
+        lockInfo->SetAborting();
+
+        auto commit = std::make_unique<NEvents::TDataEvents::TEvWrite>(commitTxId, NKikimrDataEvents::TEvWrite::MODE_PREPARE);
+        commit->Record.MutableLocks()->AddLocks()->SetLockId(lockId);
+        commit->Record.MutableLocks()->SetOp(NKikimrDataEvents::TKqpLocks::Commit);
+        ForwardToTablet(runtime, TTestTxConfig::TxTablet0, sender, commit.release());
+        auto commitResult = runtime.GrabEdgeEvent<NEvents::TDataEvents::TEvWriteResult>(sender);
+        UNIT_ASSERT(commitResult);
+        UNIT_ASSERT_VALUES_EQUAL(commitResult->Get()->Record.GetTxId(), commitTxId);
+        UNIT_ASSERT_VALUES_EQUAL(commitResult->Get()->Record.GetStatus(), NKikimrDataEvents::TEvWriteResult::STATUS_LOCKS_BROKEN);
+        UNIT_ASSERT(!lockInfo->IsTxIdAssigned());
+
+        std::vector<ui64> nextWriteIds;
+        UNIT_ASSERT(
+            WriteData(runtime, sender, writeId++, pathId, MakeTestBlob({ 100, 150 }, testTable.Schema), testTable.Schema, true, &nextWriteIds));
+    }
+
     // Path fence on TRUNCATE propose: uncommitted writes, new writes, and CommitWriteLock for a
     // lock that still holds the old generation must fail; after plan the table is empty.
     Y_UNIT_TEST(TruncateFencesWritesOnPropose) {
