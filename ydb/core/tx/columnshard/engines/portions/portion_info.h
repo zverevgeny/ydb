@@ -91,6 +91,9 @@ private:
     TInternalPathId PathId;
     ui64 PortionId = 0;   // Id of independent (overlayed by PK) portion of data in pathId
     TThreadSafeOptional<TSnapshot> RemoveSnapshot;
+    // Derived from the table's durable truncate history. Kept separate from RemoveSnapshot
+    // because a compaction started before truncate may still retire this portion afterwards.
+    TThreadSafeOptional<TSnapshot> TruncateSnapshot;
     ui64 SchemaVersion = 0;
     std::optional<ui64> ShardingVersion;
 
@@ -340,7 +343,7 @@ public:
     }
 
     NPortion::EProduced GetProduced() const {
-        if (HasRemoveSnapshot()) {
+        if (HasCleanupSnapshot()) {
             return NPortion::INACTIVE;
         }
         if (!IsDefaultTier(NBlobOperations::TGlobal::DefaultStorageId)) {
@@ -360,10 +363,27 @@ public:
     }
 
     bool IsRemovedFor(const TSnapshot& snapshot) const {
-        if (!HasRemoveSnapshot()) {
-            return false;
+        return (HasRemoveSnapshot() && GetRemoveSnapshotVerified() <= snapshot) ||
+               (TruncateSnapshot.Has() && TruncateSnapshot.Get() <= snapshot);
+    }
+
+    bool HasCleanupSnapshot() const {
+        return HasRemoveSnapshot() || TruncateSnapshot.Has();
+    }
+
+    TSnapshot GetCleanupSnapshot() const {
+        AFL_VERIFY(HasCleanupSnapshot());
+        if (!TruncateSnapshot.Has()) {
+            return GetRemoveSnapshotVerified();
+        }
+        return HasRemoveSnapshot() ? std::min(GetRemoveSnapshotVerified(), TruncateSnapshot.Get()) : TruncateSnapshot.Get();
+    }
+
+    void SetTruncateSnapshot(const TSnapshot& snapshot) {
+        if (TruncateSnapshot.Has()) {
+            AFL_VERIFY(TruncateSnapshot.Get() == snapshot);
         } else {
-            return GetRemoveSnapshotVerified() <= snapshot;
+            TruncateSnapshot.Set(snapshot);
         }
     }
 
@@ -410,7 +430,7 @@ public:
     }
 
     bool IsVisible(const TSnapshot& snapshot, const bool checkCommitSnapshot = true) const {
-        const bool visible = (!HasRemoveSnapshot() || snapshot < GetRemoveSnapshotVerified()) && DoIsVisible(snapshot, checkCommitSnapshot);
+        const bool visible = !IsRemovedFor(snapshot) && DoIsVisible(snapshot, checkCommitSnapshot);
 
         YDB_LOG_TRACE_COMP(NKikimrServices::TX_COLUMNSHARD, "",
             {"event", "IsVisible"},

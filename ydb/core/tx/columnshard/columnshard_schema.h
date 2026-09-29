@@ -118,7 +118,8 @@ struct Schema: NIceDb::Schema {
         TxDependencies = 16,
         TxStates = 17,
         TxEvents = 18,
-        TableInfoV1 = 19
+        TableInfoV1 = 19,
+        TableTruncates = 20
     };
 
     // Tablet tables
@@ -244,6 +245,17 @@ struct Schema: NIceDb::Schema {
         using TKey = TableKey<PathId, SchemeShardLocalPathId>;
         using TColumns =
             TableColumns<PathId, SchemeShardLocalPathId, DropStep, DropTxId, CopyStep, CopyTxId, IsReadOnly, LastCompletedBackupTransaction>;
+    };
+
+    struct TableTruncates: Table<(ui32)ECommonTables::TableTruncates> {
+        struct PathId: Column<1, NScheme::NTypeIds::Uint64> {};
+
+        struct Step: Column<2, NScheme::NTypeIds::Uint64> {};
+
+        struct TxId: Column<3, NScheme::NTypeIds::Uint64> {};
+
+        using TKey = TableKey<PathId, Step, TxId>;
+        using TColumns = TableColumns<PathId, Step, TxId>;
     };
 
     struct TableVersionInfo: Table<(ui32)ECommonTables::TableVersionInfo> {
@@ -779,7 +791,8 @@ struct Schema: NIceDb::Schema {
         TableInfo, TableVersionInfo, LongTxWrites, BlobsToKeep, BlobsToDelete, BlobsToDeleteWT, InsertTable, IndexGranules, IndexColumns,
         IndexCounters, SmallBlobs, OneToOneEvictedBlobs, Operations, TierBlobsDraft, TierBlobsToDelete, TierBlobsToDeleteWT, IndexIndexes,
         SharedBlobIds, BorrowedBlobIds, SourceSessions, DestinationSessions, OperationTxIds, IndexPortions, BackgroundSessions, ShardingInfo,
-        Normalizers, NormalizerEvents, InFlightSnapshots, TxDependencies, TxStates, TxEvents, IndexColumnsV1, IndexColumnsV2, TableInfoV1>;
+        Normalizers, NormalizerEvents, InFlightSnapshots, TxDependencies, TxStates, TxEvents, IndexColumnsV1, IndexColumnsV2, TableInfoV1,
+        TableTruncates>;
 
     //
 

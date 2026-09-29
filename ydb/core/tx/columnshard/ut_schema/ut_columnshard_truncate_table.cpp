@@ -115,24 +115,27 @@ void AdvanceShardPlanStep(
     PlanCommit(runtime, sender, planStep, txId);
 }
 
-// Drives GC (cleanup) until PathsToDrop becomes empty. Cleanup is gated by the read staleness
-// floor, so we advance the plan step between wakeups to push the safe boundary past the drop
-// version of the finalized generation.
-bool WaitForPathsToDropEmpty(TDefaultTestsController& controller, TTestBasicRuntime& runtime, const TActorId& sender,
-    const std::function<void()>& advancePlanStep = {}, const TDuration deadline = TDuration::Seconds(60)) {
-    const TInstant end = TInstant::Now() + deadline;
+bool HasPortionsRemovedAt(const TColumnShard& shard, const TInternalPathId pathId, const NOlap::TSnapshot& snapshot) {
+    const auto& granule = shard.GetTablesManager().GetPrimaryIndexAsVerified<NOlap::TColumnEngineForLogs>().GetGranuleVerified(pathId);
+    for (const auto& [_, portion] : granule.GetPortions()) {
+        if (portion->IsRemovedFor(snapshot)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool WaitForTruncatedPortionsCleanup(TDefaultTestsController& controller, TTestBasicRuntime& runtime, const TActorId& sender,
+    const TInternalPathId pathId, const NOlap::TSnapshot& snapshot, const std::function<void()>& advancePlanStep) {
+    const TInstant end = TInstant::Now() + TDuration::Seconds(60);
     while (TInstant::Now() < end) {
         Wakeup(runtime, sender, TTestTxConfig::TxTablet0);
-        // Re-evaluate snapshot usage so the read-staleness floor can advance past the drop version
-        // of the finalized generation; otherwise recently-used read snapshots keep blocking GC.
         ForwardToTablet(runtime, TTestTxConfig::TxTablet0, sender, new NColumnShard::TEvPrivate::TEvPingSnapshotsUsage());
-        if (advancePlanStep) {
-            advancePlanStep();
-        }
+        advancePlanStep();
         runtime.SimulateSleep(TDuration::Seconds(1));
         Y_UNUSED(controller.WaitCleaning(TDuration::Seconds(1), &runtime));
         if (const auto* shard = controller.GetAnyShard()) {
-            if (shard->GetTablesManager().GetPathsToDrop().empty()) {
+            if (!HasPortionsRemovedAt(*shard, pathId, snapshot)) {
                 return true;
             }
         }
@@ -187,9 +190,9 @@ Y_UNIT_TEST_SUITE(TruncateTable) {
         }
     }
 
-    // Write, truncate, then check both sides of the drop-version boundary:
+    // Write, truncate, then check both sides of the truncate boundary:
     // a read strictly before the truncate snapshot still sees the old data, a read exactly at
-    // the truncate snapshot sees the new (empty) generation.
+    // the truncate snapshot sees an empty table.
     Y_UNIT_TEST(WithData) {
         TTestBasicRuntime runtime;
         TTester::Setup(runtime);
@@ -304,9 +307,9 @@ Y_UNIT_TEST_SUITE(TruncateTable) {
         ProposeSchemaTxFail(runtime, sender, TTestSchema::TruncateTableTxBody(111, 1), ++txId);
     }
 
-    // Three generations with distinct row counts. Time-travel into each live window must resolve
-    // to that generation; a read exactly at a drop version is empty (old gen gone, new not yet appeared).
-    Y_UNIT_TEST(MultipleTruncatesTimeTravel) {
+    // Each truncate interval has distinct data. Time-travel and the persistent truncate history
+    // must survive reboot without changing table identity.
+    Y_UNIT_TEST_DUO(MultipleTruncatesTimeTravel, Reboot) {
         TTestBasicRuntime runtime;
         TTester::Setup(runtime);
         auto csDefaultControllerGuard = NKikimr::NYDBTest::TControllers::RegisterCSControllerGuard<TDefaultTestsController>();
@@ -316,6 +319,10 @@ Y_UNIT_TEST_SUITE(TruncateTable) {
         TestTableDescription testTable{};
         auto planStep = PrepareTablet(runtime, pathId, testTable.Schema);
 
+        const auto initialPathId = WaitForShard(*csDefaultControllerGuard.operator->(), runtime)
+                                       ->GetTablesManager()
+                                       .ResolveInternalPathId(TSchemeShardLocalPathId::FromRawValue(pathId), false);
+        UNIT_ASSERT(initialPathId);
         ui64 txId = 10;
         int writeId = 10;
         ui32 schemaRound = 0;
@@ -339,6 +346,16 @@ Y_UNIT_TEST_SUITE(TruncateTable) {
         const auto g1Snapshot = writeAndCommit(200, 230);
         const auto t2 = truncate();
         const auto g2Snapshot = writeAndCommit(300, 320);
+        if (Reboot) {
+            RebootTablet(runtime, TTestTxConfig::TxTablet0, sender);
+        }
+        const auto* shard = WaitForShard(*csDefaultControllerGuard.operator->(), runtime);
+        UNIT_ASSERT_VALUES_EQUAL(shard->GetTablesManager().GetTables().size(), 1);
+        UNIT_ASSERT_VALUES_EQUAL(
+            *shard->GetTablesManager().ResolveInternalPathId(TSchemeShardLocalPathId::FromRawValue(pathId), false), *initialPathId);
+        const auto& granule =
+            shard->GetTablesManager().GetPrimaryIndexAsVerified<NOlap::TColumnEngineForLogs>().GetGranuleVerified(*initialPathId);
+        UNIT_ASSERT_VALUES_EQUAL(granule.GetTruncateSnapshots().size(), 2);
 
         {
             TShardReader reader(runtime, TTestTxConfig::TxTablet0, pathId, g0Snapshot);
@@ -380,8 +397,7 @@ Y_UNIT_TEST_SUITE(TruncateTable) {
         }
     }
 
-    // TRUNCATE allocates a new InternalPathId. TTL settings must be copied onto that path
-    // (SchemeShard does not resend TTL on TRUNCATE) and must actually expire rows.
+    // TRUNCATE preserves TTL settings, which must continue to expire new rows.
     Y_UNIT_TEST(TruncatePreservesTtl) {
         TTestBasicRuntime runtime;
         TTester::Setup(runtime);
@@ -486,8 +502,8 @@ Y_UNIT_TEST_SUITE(TruncateTable) {
         UNIT_ASSERT_VALUES_EQUAL(evictedRowCount, 1);
     }
 
-    // When TTL is removed via ALTER and then TRUNCATE is performed, the new generation
-    // must NOT carry over the stale TTL settings. With Reboot=true, exercises the
+    // When TTL is removed via ALTER and then TRUNCATE is performed, the table
+    // must keep TTL disabled. With Reboot=true, exercises the
     // InitFromDB → AddVersionFromProto path with the nullopt case.
     Y_UNIT_TEST_DUO(TruncateAfterTtlRemoved, Reboot) {
         TTestBasicRuntime runtime;
@@ -555,7 +571,7 @@ Y_UNIT_TEST_SUITE(TruncateTable) {
             PlanSchemaTx(runtime, sender, { planStep, txId });
         }
 
-        // Verify the new generation does NOT have TTL.
+        // Verify that TTL remains disabled after truncate.
         {
             const auto newInternalPathId = shard->GetTablesManager().ResolveInternalPathId(TSchemeShardLocalPathId::FromRawValue(pathId), false);
             UNIT_ASSERT(newInternalPathId);
@@ -636,8 +652,7 @@ Y_UNIT_TEST_SUITE(TruncateTable) {
         UNIT_ASSERT_VALUES_EQUAL(ttl->GetEvictColumnName(), TTestSchema::DefaultTtlColumn);
     }
 
-    // ALTER after TRUNCATE must apply to the new generation. Pre-truncate time-travel on the old
-    // generation stays intact.
+    // ALTER after TRUNCATE updates the same table while preserving pre-truncate time-travel.
     Y_UNIT_TEST(TruncateThenAlter) {
         TTestBasicRuntime runtime;
         TTester::Setup(runtime);
@@ -716,7 +731,7 @@ Y_UNIT_TEST_SUITE(TruncateTable) {
         }
     }
 
-    // MOVE after TRUNCATE renames the SS path on every generation, including the dropped one.
+    // MOVE after TRUNCATE renames the SS path while preserving the table's truncate history.
     // Time-travel therefore works on dst, not on src. Reboot must preserve that mapping.
     Y_UNIT_TEST_DUO(TruncateThenMove, Reboot) {
         TTestBasicRuntime runtime;
@@ -797,7 +812,7 @@ Y_UNIT_TEST_SUITE(TruncateTable) {
         }
     }
 
-    // COPY after TRUNCATE aliases the new (empty) generation. The copy is pinned at its CopyVersion,
+    // COPY after TRUNCATE captures the empty table. The copy is pinned at its CopyVersion,
     // so later writes to the source are NOT visible on the copy.
     Y_UNIT_TEST(TruncateThenCopy) {
         TTestBasicRuntime runtime;
@@ -874,8 +889,8 @@ Y_UNIT_TEST_SUITE(TruncateTable) {
             UNIT_ASSERT(!reader.IsError());
         }
         {
-            // The copy is pinned at CopyVersion (taken right after the truncate, when the new
-            // generation was still empty), so the later source write is invisible on dst.
+            // The copy is pinned at CopyVersion, taken while the table was empty after truncate,
+            // so the later source write is invisible on dst.
             TShardReader reader(runtime, TTestTxConfig::TxTablet0, dstPathId, NOlap::TSnapshot(planStep, txId));
             reader.SetReplyColumnIds(TTestSchema::ExtractIds(testTable.Schema));
             auto rb = reader.ReadAll();
@@ -979,9 +994,8 @@ Y_UNIT_TEST_SUITE(TruncateTable) {
         }
     }
 
-    // Retention: two copies keep the old generation alive. After truncate, source latest is empty,
-    // source time-travel still sees old data, copies keep old data. After reboot those reads (including
-    // source MVCC) and the path-local drop version must survive; GC waits until every copy is dropped.
+    // Copies and time-travel retain truncated portions across reboot. Once both copies are
+    // dropped and snapshots expire, GC removes those portions while retaining the live source.
     Y_UNIT_TEST(TruncateCopySourceRetention) {
         TTestBasicRuntime runtime;
         SetupTruncateTestRuntime(runtime);
@@ -1073,8 +1087,12 @@ Y_UNIT_TEST_SUITE(TruncateTable) {
             const auto pathDropVersion = restartedShard->GetTablesManager()
                                              .GetTable(*oldInternalPathId)
                                              .GetPathDropVersionOptional(TSchemeShardLocalPathId::FromRawValue(srcPathId));
-            UNIT_ASSERT(pathDropVersion.has_value());
-            UNIT_ASSERT_VALUES_EQUAL(*pathDropVersion, truncateSnapshot);
+            UNIT_ASSERT(!pathDropVersion);
+            UNIT_ASSERT(restartedShard->GetTablesManager()
+                            .GetPrimaryIndexAsVerified<NOlap::TColumnEngineForLogs>()
+                            .GetGranuleVerified(*oldInternalPathId)
+                            .GetTruncateSnapshots()
+                            .contains(truncateSnapshot));
         }
 
         {
@@ -1123,24 +1141,23 @@ Y_UNIT_TEST_SUITE(TruncateTable) {
 
         planStep = ProposeSchemaTx(runtime, sender, TTestSchema::DropTableTxBody(copyPathIdB, 1), ++txId);
         PlanSchemaTx(runtime, sender, { planStep, txId });
-        UNIT_ASSERT(restartedShard->GetTablesManager().GetTable(*oldInternalPathId, true).IsDropped());
+        UNIT_ASSERT(!restartedShard->GetTablesManager().GetTable(*oldInternalPathId, true).IsDropped());
 
-        // The old generation is pinned by read snapshots taken above; expire them immediately and
-        // enable the cleanup background so GC can finalize the drop within the wait deadline.
+        // Expire read snapshots and allow GC to remove truncated portions.
         csControllerGuard->SetOverrideUsedSnapshotLivetime(TDuration::Zero());
         csControllerGuard->EnableBackground(NKikimr::NYDBTest::ICSController::EBackground::Cleanup);
         auto advancePlanStep = [&] {
             AdvanceShardPlanStep(runtime, sender, txId, writeId, srcPathId, testTable);
         };
-        UNIT_ASSERT(WaitForPathsToDropEmpty(csController, runtime, sender, advancePlanStep));
+        UNIT_ASSERT(WaitForTruncatedPortionsCleanup(csController, runtime, sender, *oldInternalPathId, truncateSnapshot, advancePlanStep));
 
         {
             const auto* finalizedShard = csController.GetAnyShard();
             UNIT_ASSERT(finalizedShard);
-            UNIT_ASSERT(!finalizedShard->GetTablesManager().HasTable(*oldInternalPathId));
+            UNIT_ASSERT(finalizedShard->GetTablesManager().HasTable(*oldInternalPathId));
         }
         {
-            // After GC finalizes the old generation, the read-staleness floor has advanced past
+            // After GC removes truncated portions, the read-staleness floor has advanced past
             // snapshotBeforeTruncate, so the time-travel read is rejected ("Snapshot too old").
             TShardReader reader(runtime, TTestTxConfig::TxTablet0, srcPathId, snapshotBeforeTruncate);
             reader.SetReplyColumnIds(TTestSchema::ExtractIds(testTable.Schema));
@@ -1150,8 +1167,7 @@ Y_UNIT_TEST_SUITE(TruncateTable) {
         }
     }
 
-    // A scan that has already started on a copy must keep the old generation readable while
-    // TRUNCATE replaces the source and DROP removes the last copy.
+    // An active copy scan must retain its portions across source TRUNCATE and copy DROP.
     Y_UNIT_TEST(ActiveCopyScanSurvivesTruncateAndDrop) {
         TTestBasicRuntime runtime;
         SetupTruncateTestRuntime(runtime);
@@ -1186,12 +1202,13 @@ Y_UNIT_TEST_SUITE(TruncateTable) {
 
         planStep = ProposeSchemaTx(runtime, sender, TTestSchema::TruncateTableTxBody(srcPathId, 2), ++txId);
         PlanSchemaTx(runtime, sender, { planStep, txId });
+        const auto truncateSnapshot = NOlap::TSnapshot(planStep, txId);
         planStep = ProposeSchemaTx(runtime, sender, TTestSchema::DropTableTxBody(copyPathId, 1), ++txId);
         PlanSchemaTx(runtime, sender, { planStep, txId });
 
         shard = WaitForShard(controller, runtime);
-        UNIT_ASSERT(shard->GetTablesManager().GetTable(*oldInternalPathId, true).IsDropped());
-        AssertPathsToDropState(*shard, *oldInternalPathId, true);
+        UNIT_ASSERT(!shard->GetTablesManager().GetTable(*oldInternalPathId, true).IsDropped());
+        AssertPathsToDropState(*shard, *oldInternalPathId, false);
 
         controllerGuard->SetOverrideUsedSnapshotLivetime(TDuration::Zero());
         controllerGuard->EnableBackground(NKikimr::NYDBTest::ICSController::EBackground::Cleanup);
@@ -1202,8 +1219,8 @@ Y_UNIT_TEST_SUITE(TruncateTable) {
             runtime.SimulateSleep(TDuration::Seconds(1));
             Y_UNUSED(controller.WaitCleaning(TDuration::Seconds(1), &runtime));
             shard = WaitForShard(controller, runtime);
-            UNIT_ASSERT_C(
-                shard->GetTablesManager().HasTable(*oldInternalPathId, true), "GC must retain the old generation while the copy scan is active");
+            UNIT_ASSERT_C(HasPortionsRemovedAt(*shard, *oldInternalPathId, truncateSnapshot),
+                "GC must retain truncated portions while the copy scan is active");
         }
 
         activeScan.Ack();
@@ -1215,13 +1232,12 @@ Y_UNIT_TEST_SUITE(TruncateTable) {
         auto advancePlanStep = [&] {
             AdvanceShardPlanStep(runtime, sender, txId, writeId, srcPathId, testTable);
         };
-        UNIT_ASSERT(WaitForPathsToDropEmpty(controller, runtime, sender, advancePlanStep));
-        UNIT_ASSERT(!controller.GetAnyShard()->GetTablesManager().HasTable(*oldInternalPathId, true));
+        UNIT_ASSERT(WaitForTruncatedPortionsCleanup(controller, runtime, sender, *oldInternalPathId, truncateSnapshot, advancePlanStep));
+        UNIT_ASSERT(controller.GetAnyShard()->GetTablesManager().HasTable(*oldInternalPathId, true));
     }
 
-    // With registry-based snapshot retention, a live copy pins the old generation but need
-    // not pin the source's new generation after that source is dropped. A late source scan
-    // must fail normally when only the old generation remains in path history.
+    // A live copy retains the shared table after source DROP. Expired source scans must
+    // fail normally while the copy remains readable.
     Y_UNIT_TEST(DroppedSourceWithLiveCopyRejectsLateScanAfterGc) {
         TTestBasicRuntime runtime;
         TTester::Setup(runtime);
@@ -1264,17 +1280,17 @@ Y_UNIT_TEST_SUITE(TruncateTable) {
         shard = WaitForShard(controller, runtime);
         const auto newInternalPathId = shard->GetTablesManager().ResolveInternalPathId(TSchemeShardLocalPathId::FromRawValue(srcPathId), false);
         UNIT_ASSERT(newInternalPathId);
-        UNIT_ASSERT_UNEQUAL(*oldInternalPathId, *newInternalPathId);
+        UNIT_ASSERT_VALUES_EQUAL(*oldInternalPathId, *newInternalPathId);
 
         planStep = ProposeSchemaTx(runtime, sender, TTestSchema::DropTableTxBody(srcPathId, 3), ++txId);
         PlanSchemaTx(runtime, sender, { planStep, txId });
         shard = WaitForShard(controller, runtime);
-        AssertPathsToDropState(*shard, *newInternalPathId, true);
+        AssertPathsToDropState(*shard, *newInternalPathId, false);
         AssertPathsToDropState(*shard, *oldInternalPathId, false);
 
         controllerGuard->EnableBackground(NKikimr::NYDBTest::ICSController::EBackground::Cleanup);
         ui64 nextPlanStep = planStep.Val() + 10000;
-        for (ui32 i = 0; i < 60 && controller.GetAnyShard()->GetTablesManager().HasTable(*newInternalPathId, true); ++i) {
+        for (ui32 i = 0; i < 5; ++i) {
             runtime.SimulateSleep(TDuration::Seconds(1));
             auto registryBuilder = CreateImmutableSnapshotRegistryBuilder();
             registryBuilder->SetOldestCollectionTime(runtime.GetCurrentTime());
@@ -1285,7 +1301,7 @@ Y_UNIT_TEST_SUITE(TruncateTable) {
         }
 
         shard = WaitForShard(controller, runtime);
-        UNIT_ASSERT_C(!shard->GetTablesManager().HasTable(*newInternalPathId, true), "the dropped new generation must be finalized");
+        UNIT_ASSERT_C(shard->GetTablesManager().HasTable(*newInternalPathId, true), "the copy must retain the shared table");
         UNIT_ASSERT(shard->GetTablesManager().HasTable(*oldInternalPathId, true));
         const auto src = TSchemeShardLocalPathId::FromRawValue(srcPathId);
         UNIT_ASSERT(!shard->GetTablesManager().ResolveInternalPathId(src, false));
@@ -1309,7 +1325,7 @@ Y_UNIT_TEST_SUITE(TruncateTable) {
         UNIT_ASSERT_VALUES_EQUAL(rows->num_rows(), 100);
     }
 
-    // Second TRUNCATE of the source while a copy of the first generation is still alive.
+    // Second TRUNCATE of the source while a copy of its initial contents is still alive.
     Y_UNIT_TEST(TruncateSourceTwiceWithLiveCopy) {
         TTestBasicRuntime runtime;
         TTester::Setup(runtime);
@@ -1593,7 +1609,7 @@ Y_UNIT_TEST_SUITE(TruncateTable) {
         }
     }
 
-    Y_UNIT_TEST(CommitOldGenerationAfterTruncatePlanIsRejected) {
+    Y_UNIT_TEST(CommitOldLockAfterTruncatePlanIsRejected) {
         TTestBasicRuntime runtime;
         TTester::Setup(runtime);
         auto csDefaultControllerGuard = NKikimr::NYDBTest::TControllers::RegisterCSControllerGuard<TDefaultTestsController>();
@@ -1625,8 +1641,8 @@ Y_UNIT_TEST_SUITE(TruncateTable) {
         PlanSchemaTx(runtime, sender, { planStep, txId });
         const auto truncateSnapshot = NOlap::TSnapshot(planStep, txId);
 
-        // The live SchemeShard path now resolves to a new InternalPathId, while the accepted
-        // write in this lock still targets the old generation retained by the copy.
+        // The table identity is unchanged, but truncate must break the lock of a write
+        // accepted before its plan step.
         ProposeCommitFail(runtime, sender, TTestTxConfig::TxTablet0, ++txId, lockedWriteIds, lockId);
 
         {
@@ -1651,6 +1667,201 @@ Y_UNIT_TEST_SUITE(TruncateTable) {
             UNIT_ASSERT_VALUES_EQUAL(rb->num_rows(), 100);
             UNIT_ASSERT(!reader.IsError());
         }
+    }
+
+    Y_UNIT_TEST_DUO(TruncatePausesNewCompactions, Reboot) {
+        TTestBasicRuntime runtime;
+        TTester::Setup(runtime);
+        auto controller = NKikimr::NYDBTest::TControllers::RegisterCSControllerGuard<NOlap::TWaitCompactionController>();
+        controller->DisableBackground(NKikimr::NYDBTest::ICSController::EBackground::Compaction);
+        controller->DisableBackground(NKikimr::NYDBTest::ICSController::EBackground::Cleanup);
+        TActorId sender = runtime.AllocateEdgeActor();
+        TestTableDescription table{};
+        Y_UNUSED(PrepareTablet(runtime, 1, table.Schema));
+        ui64 txId = 10;
+        int writeId = 10;
+        auto write = [&] {
+            std::vector<ui64> ids;
+            UNIT_ASSERT(WriteData(runtime, sender, writeId++, 1, MakeTestBlob({ 0, 100 }, table.Schema), table.Schema, true, &ids));
+            const auto step = ProposeCommit(runtime, sender, ++txId, ids);
+            PlanCommit(runtime, sender, step, txId);
+        };
+        for (ui32 i = 0; i < 4; ++i) {
+            write();
+        }
+        const auto internalPathId =
+            *WaitForShard(*controller.operator->(), runtime)->GetTablesManager().ResolveInternalPathId(TSchemeShardLocalPathId::FromRawValue(1),
+                false);
+        auto priority = [&] {
+            const auto& granule = WaitForShard(*controller.operator->(), runtime)
+                                      ->GetTablesManager()
+                                      .GetPrimaryIndexAsVerified<NOlap::TColumnEngineForLogs>()
+                                      .GetGranuleVerified(internalPathId);
+            granule.ActualizeOptimizer(runtime.GetCurrentTime(), TDuration::Zero());
+            return granule.GetCompactionPriority();
+        };
+        runtime.SimulateSleep(TDuration::Seconds(1));
+        UNIT_ASSERT(!priority().IsZero());
+        const auto truncateTxId = ++txId;
+        const auto step = ProposeSchemaTx(runtime, sender, TTestSchema::TruncateTableTxBody(1, 1), truncateTxId);
+        UNIT_ASSERT(priority().IsZero());
+        if (Reboot) {
+            RebootTablet(runtime, TTestTxConfig::TxTablet0, sender);
+            UNIT_ASSERT(priority().IsZero());
+        }
+        controller->EnableBackground(NKikimr::NYDBTest::ICSController::EBackground::Compaction);
+        const auto startedBefore = controller->GetCompactionStartedCounter().Val();
+        for (ui32 i = 0; i < 3; ++i) {
+            Wakeup(runtime, sender, TTestTxConfig::TxTablet0);
+            runtime.SimulateSleep(TDuration::Seconds(1));
+        }
+        UNIT_ASSERT_VALUES_EQUAL(controller->GetCompactionStartedCounter().Val(), startedBefore);
+        controller->DisableBackground(NKikimr::NYDBTest::ICSController::EBackground::Compaction);
+        PlanSchemaTx(runtime, sender, { step, truncateTxId });
+        for (ui32 i = 0; i < 4; ++i) {
+            write();
+        }
+        runtime.SimulateSleep(TDuration::Seconds(1));
+        UNIT_ASSERT(!priority().IsZero());
+    }
+
+    Y_UNIT_TEST_DUO(CompactionPublishedAfterTruncate, Reboot) {
+        TTestBasicRuntime runtime;
+        TTester::Setup(runtime);
+        auto controller = NKikimr::NYDBTest::TControllers::RegisterCSControllerGuard<NOlap::TWaitCompactionController>();
+        controller->DisableBackground(NKikimr::NYDBTest::ICSController::EBackground::Cleanup);
+        controller->DisableBackground(NKikimr::NYDBTest::ICSController::EBackground::Compaction);
+        TActorId sender = runtime.AllocateEdgeActor();
+        TestTableDescription table{};
+        Y_UNUSED(PrepareTablet(runtime, 1, table.Schema));
+        ui64 txId = 10;
+        int writeId = 10;
+        auto write = [&](ui64 from, ui64 to) {
+            std::vector<ui64> ids;
+            UNIT_ASSERT(WriteData(runtime, sender, writeId++, 1, MakeTestBlob({ from, to }, table.Schema), table.Schema, true, &ids));
+            auto step = ProposeCommit(runtime, sender, ++txId, ids);
+            PlanCommit(runtime, sender, step, txId);
+            return NOlap::TSnapshot(step, txId);
+        };
+        for (ui32 i = 0; i < 4; ++i) {
+            write(0, 100);
+        }
+        auto step = ProposeSchemaTx(runtime, sender, TTestSchema::CopyTableTxBody(1, 2, 1), ++txId);
+        PlanSchemaTx(runtime, sender, { step, txId });
+        const auto beforeTruncate = NOlap::TSnapshot(step, txId);
+
+        std::vector<TAutoPtr<IEventHandle>> delayedCompactions;
+        runtime.SetEventFilter([&](TTestActorRuntimeBase&, TAutoPtr<IEventHandle>& ev) {
+            if (auto* msg = TryGetPrivateEvent<NColumnShard::TEvPrivate::TEvWriteIndex>(ev)) {
+                if (msg->GetPutStatus() == NKikimrProto::OK &&
+                    std::dynamic_pointer_cast<NOlap::TCompactColumnEngineChanges>(msg->IndexChanges)) {
+                    delayedCompactions.emplace_back(ev.Release());
+                    return true;
+                }
+            }
+            return false;
+        });
+        controller->EnableBackground(NKikimr::NYDBTest::ICSController::EBackground::Compaction);
+        for (ui32 i = 0; delayedCompactions.empty() && i < 30; ++i) {
+            Wakeup(runtime, sender, TTestTxConfig::TxTablet0);
+            runtime.SimulateSleep(TDuration::Seconds(1));
+        }
+        UNIT_ASSERT_C(!delayedCompactions.empty(), "compaction must be ready to publish before truncate");
+        controller->DisableBackground(NKikimr::NYDBTest::ICSController::EBackground::Compaction);
+        step = ProposeSchemaTx(runtime, sender, TTestSchema::TruncateTableTxBody(1, 2), ++txId);
+        PlanSchemaTx(runtime, sender, { step, txId });
+        const auto afterWrite = write(1000, 1020);
+
+        const auto finishedBefore = controller->GetCompactionFinishedCounter().Val();
+        const intptr_t delayedCount = delayedCompactions.size();
+        runtime.SetEventFilter([](TTestActorRuntimeBase&, TAutoPtr<IEventHandle>&) {
+            return false;
+        });
+        for (auto& ev : delayedCompactions) {
+            runtime.Send(ev.Release());
+        }
+        for (ui32 i = 0; controller->GetCompactionFinishedCounter().Val() < finishedBefore + delayedCount && i < 30; ++i) {
+            runtime.SimulateSleep(TDuration::Seconds(1));
+        }
+        UNIT_ASSERT_VALUES_EQUAL(controller->GetCompactionFinishedCounter().Val(), finishedBefore + delayedCount);
+        auto checkRows = [&](ui64 pathId, const NOlap::TSnapshot& snapshot, ui64 count) {
+            TShardReader reader(runtime, TTestTxConfig::TxTablet0, pathId, snapshot);
+            reader.SetReplyColumnIds(TTestSchema::ExtractIds(table.Schema));
+            auto rows = reader.ReadAll();
+            UNIT_ASSERT(!reader.IsError());
+            UNIT_ASSERT_VALUES_EQUAL(rows ? rows->num_rows() : 0, count);
+        };
+        checkRows(1, beforeTruncate, 100);
+        checkRows(1, afterWrite, 20);
+        checkRows(2, afterWrite, 100);
+
+        step = ProposeSchemaTx(runtime, sender, TTestSchema::CopyTableTxBody(1, 3, 3), ++txId);
+        PlanSchemaTx(runtime, sender, { step, txId });
+        step = ProposeSchemaTx(runtime, sender, TTestSchema::TruncateTableTxBody(1, 4), ++txId);
+        PlanSchemaTx(runtime, sender, { step, txId });
+        const auto afterSecondTruncate = NOlap::TSnapshot(step, txId);
+        if (Reboot) {
+            RebootTablet(runtime, TTestTxConfig::TxTablet0, sender);
+        }
+        checkRows(1, beforeTruncate, 100);
+        checkRows(1, afterWrite, 20);
+        checkRows(1, afterSecondTruncate, 0);
+        checkRows(2, afterSecondTruncate, 100);
+        checkRows(3, afterSecondTruncate, 20);
+    }
+
+    Y_UNIT_TEST(TruncateBreaksSourceReadLocks) {
+        TTestBasicRuntime runtime;
+        TTester::Setup(runtime);
+        auto controller = NKikimr::NYDBTest::TControllers::RegisterCSControllerGuard<TDefaultTestsController>();
+        controller->DisableBackground(NKikimr::NYDBTest::ICSController::EBackground::Cleanup);
+        TActorId sender = runtime.AllocateEdgeActor();
+        TestTableDescription table{};
+        Y_UNUSED(PrepareTablet(runtime, 1, table.Schema));
+        std::vector<ui64> ids;
+        UNIT_ASSERT(WriteData(runtime, sender, 10, 1, MakeTestBlob({ 0, 100 }, table.Schema), table.Schema, true, &ids));
+        auto step = ProposeCommit(runtime, sender, 11, ids);
+        PlanCommit(runtime, sender, step, 11);
+        step = ProposeSchemaTx(runtime, sender, TTestSchema::CopyTableTxBody(1, 2, 1), 12);
+        PlanSchemaTx(runtime, sender, { step, 12 });
+        const auto readSnapshot = NOlap::TSnapshot(step, 12);
+
+        ui64 scanLockId = 0;
+        runtime.SetEventFilter([&](TTestActorRuntimeBase&, TAutoPtr<IEventHandle>& ev) {
+            if (ev->GetTypeRewrite() == TEvDataShard::TEvKqpScan::EventType && scanLockId) {
+                auto& record = ev->Get<TEvDataShard::TEvKqpScan>()->Record;
+                record.SetLockTxId(scanLockId);
+                record.SetLockMode(NKikimrDataEvents::OPTIMISTIC);
+            }
+            return false;
+        });
+        auto readWithLock = [&](ui64 pathId, ui64 lockId) {
+            scanLockId = lockId;
+            TShardReader reader(runtime, TTestTxConfig::TxTablet0, pathId, readSnapshot);
+            reader.SetReplyColumnIds(TTestSchema::ExtractIds(table.Schema));
+            UNIT_ASSERT(reader.ReadAll());
+            UNIT_ASSERT(!reader.IsError());
+            scanLockId = 0;
+        };
+        auto isBroken = [&](ui64 lockId) {
+            auto* lock = WaitForShard(*controller.operator->(), runtime)->GetOperationsManager().GetLockOptional(lockId);
+            UNIT_ASSERT(lock);
+            return lock->IsBroken();
+        };
+        readWithLock(1, 101);
+        readWithLock(2, 102);
+        UNIT_ASSERT(!isBroken(101));
+        UNIT_ASSERT(!isBroken(102));
+        step = ProposeSchemaTx(runtime, sender, TTestSchema::TruncateTableTxBody(1, 2), 13);
+        PlanSchemaTx(runtime, sender, { step, 13 });
+        UNIT_ASSERT(isBroken(101));
+        UNIT_ASSERT(!isBroken(102));
+
+        // A late read of the source's old snapshot must also conflict with truncate.
+        readWithLock(1, 103);
+        readWithLock(2, 104);
+        UNIT_ASSERT(isBroken(103));
+        UNIT_ASSERT(!isBroken(104));
     }
 
     Y_UNIT_TEST(CommitIsRejectedAfterAbortWasQueued) {
@@ -1707,7 +1918,7 @@ Y_UNIT_TEST_SUITE(TruncateTable) {
     }
 
     // Path fence on TRUNCATE propose: uncommitted writes, new writes, and CommitWriteLock for a
-    // lock that still holds the old generation must fail; after plan the table is empty.
+    // lock that wrote before the fence must fail; after plan the table is empty.
     Y_UNIT_TEST(TruncateFencesWritesOnPropose) {
         TTestBasicRuntime runtime;
         TTester::Setup(runtime);
@@ -1873,9 +2084,9 @@ Y_UNIT_TEST_SUITE(TruncateTable) {
         }
     }
 
-    // After TRUNCATE without copies, cleanup must finalize the old generation without crashing
-    // ForgetLivePathIdVerified. Time-travel works until GC, then the old data is gone.
-    Y_UNIT_TEST(TruncateThenCleanupFinalizesOldGeneration) {
+    // Cleanup removes truncated portions without deleting the live table. Time-travel
+    // works until retention expires.
+    Y_UNIT_TEST(TruncateCleanupPreservesTable) {
         TTestBasicRuntime runtime;
         SetupTruncateTestRuntime(runtime);
         auto csControllerGuard = RegisterTruncateTestController();
@@ -1907,18 +2118,9 @@ Y_UNIT_TEST_SUITE(TruncateTable) {
 
         const auto newInternalPathId = shard->GetTablesManager().ResolveInternalPathId(TSchemeShardLocalPathId::FromRawValue(pathId), false);
         UNIT_ASSERT(newInternalPathId);
-        TInternalPathId oldInternalPathId;
-        {
-            const auto& tables = shard->GetTablesManager().GetTables();
-            for (const auto& [internalPathId, table] : tables) {
-                if (internalPathId != *newInternalPathId && table.IsDropped()) {
-                    oldInternalPathId = internalPathId;
-                    break;
-                }
-            }
-            UNIT_ASSERT(oldInternalPathId.IsValid());
-        }
-        AssertPathsToDropState(*shard, oldInternalPathId, true);
+        UNIT_ASSERT_VALUES_EQUAL(shard->GetTablesManager().GetTables().size(), 1);
+        AssertPathsToDropState(*shard, *newInternalPathId, false);
+        UNIT_ASSERT(HasPortionsRemovedAt(*shard, *newInternalPathId, truncateSnapshot));
         {
             TShardReader reader(runtime, TTestTxConfig::TxTablet0, pathId, snapshotBeforeTruncate);
             reader.SetReplyColumnIds(TTestSchema::ExtractIds(testTable.Schema));
@@ -1928,14 +2130,13 @@ Y_UNIT_TEST_SUITE(TruncateTable) {
             UNIT_ASSERT(!reader.IsError());
         }
 
-        // The old generation is pinned by the time-travel read above; expire used snapshots
-        // immediately and enable the cleanup background so GC can finalize the drop.
+        // Expire the time-travel snapshot and enable cleanup of truncated portions.
         csControllerGuard->SetOverrideUsedSnapshotLivetime(TDuration::Zero());
         csControllerGuard->EnableBackground(NKikimr::NYDBTest::ICSController::EBackground::Cleanup);
         auto advancePlanStep = [&] {
             AdvanceShardPlanStep(runtime, sender, txId, writeId, pathId, testTable);
         };
-        UNIT_ASSERT(WaitForPathsToDropEmpty(csController, runtime, sender, advancePlanStep));
+        UNIT_ASSERT(WaitForTruncatedPortionsCleanup(csController, runtime, sender, *newInternalPathId, truncateSnapshot, advancePlanStep));
 
         {
             const auto* finalizedShard = csController.GetAnyShard();
@@ -1943,7 +2144,7 @@ Y_UNIT_TEST_SUITE(TruncateTable) {
             const auto& tables = finalizedShard->GetTablesManager().GetTables();
             UNIT_ASSERT_VALUES_EQUAL(tables.size(), 1);
             UNIT_ASSERT(tables.contains(*newInternalPathId));
-            UNIT_ASSERT(!tables.contains(oldInternalPathId));
+            UNIT_ASSERT(!HasPortionsRemovedAt(*finalizedShard, *newInternalPathId, truncateSnapshot));
         }
         {
             // GC advanced the read-staleness floor past the truncate snapshot, so this read is rejected.
@@ -1954,13 +2155,30 @@ Y_UNIT_TEST_SUITE(TruncateTable) {
             UNIT_ASSERT(reader.IsError());
         }
         {
-            // Likewise, snapshotBeforeTruncate is below the floor after GC finalized the old generation.
+            // Likewise, snapshotBeforeTruncate is below the floor after GC removed truncated portions.
             TShardReader reader(runtime, TTestTxConfig::TxTablet0, pathId, snapshotBeforeTruncate);
             reader.SetReplyColumnIds(TTestSchema::ExtractIds(testTable.Schema));
             auto rb = reader.ReadAll();
             UNIT_ASSERT(!rb);
             UNIT_ASSERT(reader.IsError());
         }
+
+        // Final DROP must remove the durable truncate history together with the table.
+        planStep = ProposeSchemaTx(runtime, sender, TTestSchema::DropTableTxBody(pathId, 2), ++txId);
+        PlanSchemaTx(runtime, sender, { planStep, txId });
+        ui64 nextPlanStep = planStep.Val() + 10000;
+        const auto deadline = TInstant::Now() + TDuration::Seconds(60);
+        while (csController.GetShard()->GetTablesManager().HasTable(*newInternalPathId, true) && TInstant::Now() < deadline) {
+            PlanCommit(runtime, sender, TPlanStep{ nextPlanStep }, TSet<ui64>{});
+            nextPlanStep += 10000;
+            Wakeup(runtime, sender, TTestTxConfig::TxTablet0);
+            ForwardToTablet(runtime, TTestTxConfig::TxTablet0, sender, new NColumnShard::TEvPrivate::TEvPingSnapshotsUsage());
+            runtime.SimulateSleep(TDuration::Seconds(1));
+            Y_UNUSED(csController.WaitCleaning(TDuration::Seconds(1), &runtime));
+        }
+        UNIT_ASSERT(!csController.GetShard()->GetTablesManager().HasTable(*newInternalPathId, true));
+        RebootTablet(runtime, TTestTxConfig::TxTablet0, sender);
+        UNIT_ASSERT(WaitForShard(csController, runtime)->GetTablesManager().GetTables().empty());
     }
 }
 }   // namespace NKikimr

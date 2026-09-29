@@ -330,9 +330,9 @@ public:
             ErrorMessage = "table generation changed: " + ::ToString(changedPath->GetSchemeShardLocalPathId());
             return true;
         }
-        if (lockInfo->NeedsAborting()) {
+        if (lockInfo->NeedsAborting() || lockInfo->IsBroken()) {
             ErrorStatus = NKikimrDataEvents::TEvWriteResult::STATUS_LOCKS_BROKEN;
-            ErrorMessage = "lock is already being aborted: " + ::ToString(WriteCommit->GetLockId());
+            ErrorMessage = "lock is broken or being aborted: " + ::ToString(WriteCommit->GetLockId());
             return true;
         }
         lockInfo->SetTxId(WriteCommit->GetTxId());

@@ -15,6 +15,26 @@
 
 namespace NKikimr::NOlap {
 
+void TGranuleMeta::ApplyTruncateSnapshots(TPortionInfo& portion, const TSnapshot& commitSnapshot) const {
+    const auto it = TruncateSnapshots.upper_bound(commitSnapshot);
+    if (it != TruncateSnapshots.end()) {
+        portion.SetTruncateSnapshot(*it);
+    }
+}
+
+void TGranuleMeta::ApplyTruncateSnapshots(TPortionInfo& portion) const {
+    if (!portion.IsCommitted() || portion.IsAborted() || TruncateSnapshots.empty()) {
+        return;
+    }
+    const auto it = TruncateSnapshots.upper_bound(portion.RecordSnapshotMin(std::nullopt));
+    if (it != TruncateSnapshots.end()) {
+        // Truncated portions leave the optimizer before new writes can enter it. A task
+        // already running at truncate can only publish data from an earlier interval.
+        AFL_VERIFY(portion.RecordSnapshotMax(std::nullopt) < *it)("portion", portion.DebugString());
+        portion.SetTruncateSnapshot(*it);
+    }
+}
+
 void TGranuleMeta::AppendPortion(const std::shared_ptr<TPortionInfo>& info) {
     YDB_LOG_TRACE("",
         {"event", "upsert_portion"},
@@ -69,7 +89,7 @@ void TGranuleMeta::OnAfterChangePortion(const std::shared_ptr<TPortionInfo> port
     NStorageOptimizer::IOptimizerPlanner::TModificationGuard* modificationGuard, const bool onLoad) {
     if (portionAfter) {
         PortionInfoGuard.OnNewPortion(portionAfter);
-        if (!portionAfter->HasRemoveSnapshot()) {
+        if (!portionAfter->HasCleanupSnapshot()) {
             PortionsIndex.AddPortion(portionAfter);
             if (modificationGuard) {
                 modificationGuard->AddPortion(portionAfter);
@@ -84,7 +104,7 @@ void TGranuleMeta::OnAfterChangePortion(const std::shared_ptr<TPortionInfo> port
         Stats->OnAddPortion(*portionAfter);
     }
     if (!!AdditiveSummaryCache) {
-        if (portionAfter && !portionAfter->HasRemoveSnapshot()) {
+        if (portionAfter && !portionAfter->HasCleanupSnapshot()) {
             auto g = AdditiveSummaryCache->StartEdit(Counters);
             g.AddPortion(*portionAfter);
         }
@@ -97,7 +117,7 @@ void TGranuleMeta::OnAfterChangePortion(const std::shared_ptr<TPortionInfo> port
 void TGranuleMeta::OnBeforeChangePortion(const std::shared_ptr<TPortionInfo> portionBefore) {
     if (portionBefore) {
         PortionInfoGuard.OnDropPortion(portionBefore);
-        if (!portionBefore->HasRemoveSnapshot()) {
+        if (!portionBefore->HasCleanupSnapshot()) {
             PortionsIndex.RemovePortion(portionBefore);
             OptimizerPlanner->StartModificationGuard().RemovePortion(portionBefore);
             ActualizationIndex->RemovePortion(portionBefore);
@@ -105,7 +125,7 @@ void TGranuleMeta::OnBeforeChangePortion(const std::shared_ptr<TPortionInfo> por
         Stats->OnRemovePortion(*portionBefore);
     }
     if (!!AdditiveSummaryCache) {
-        if (portionBefore && !portionBefore->HasRemoveSnapshot()) {
+        if (portionBefore && !portionBefore->HasCleanupSnapshot()) {
             auto g = AdditiveSummaryCache->StartEdit(Counters);
             g.RemovePortion(*portionBefore);
         }
@@ -138,7 +158,7 @@ void TGranuleMeta::RebuildAdditiveMetrics() const {
     {
         auto g = result.StartEdit(Counters);
         for (auto&& i : Portions) {
-            if (i.second->HasRemoveSnapshot()) {
+            if (i.second->HasCleanupSnapshot()) {
                 continue;
             }
             g.AddPortion(*i.second);
@@ -177,6 +197,7 @@ TGranuleMeta::TGranuleMeta(const TInternalPathId pathId, const TGranulesStorage&
 }
 
 void TGranuleMeta::UpsertPortionOnLoad(const std::shared_ptr<TPortionInfo>& portion) {
+    ApplyTruncateSnapshots(*portion);
     if (portion->GetPortionType() == EPortionType::Written) {
         auto writtenPortion = std::static_pointer_cast<TWrittenPortionInfo>(portion);
         const TInsertWriteId insertWriteId = writtenPortion->GetInsertWriteId();
@@ -234,7 +255,7 @@ void TGranuleMeta::ResetOptimizer(const std::shared_ptr<NStorageOptimizer::IOpti
     AFL_VERIFY(!!OptimizerPlanner);
     std::vector<std::shared_ptr<TPortionInfo>> portions;
     for (auto&& i : Portions) {
-        if (i.second->HasRemoveSnapshot()) {
+        if (i.second->HasCleanupSnapshot()) {
             continue;
         }
         portions.emplace_back(i.second);
@@ -254,7 +275,7 @@ void TGranuleMeta::ResetMetadataManager(const std::shared_ptr<NDataAccessorContr
     AFL_VERIFY(!!OptimizerPlanner);
     THashMap<ui64, std::shared_ptr<TPortionInfo>> portions;
     for (auto&& i : Portions) {
-        if (i.second->HasRemoveSnapshot()) {
+        if (i.second->HasCleanupSnapshot()) {
             continue;
         }
         portions.emplace(i.first, i.second);
@@ -344,6 +365,7 @@ void TGranuleMeta::CommitPortionOnExecute(
     NTabletFlatExecutor::TTransactionContext& txc, const TInsertWriteId insertWriteId, const TSnapshot& snapshot) const {
     auto it = InsertedPortions.find(insertWriteId);
     AFL_VERIFY(it != InsertedPortions.end());
+    ApplyTruncateSnapshots(*it->second, snapshot);
     it->second->SetCommitSnapshot(snapshot);
     TDbWrapper wrapper(txc.DB, nullptr);
     it->second->CommitToDatabase(wrapper);
@@ -370,6 +392,7 @@ void TGranuleMeta::CommitImmediateOnExecute(NTabletFlatExecutor::TTransactionCon
     auto writtenPortion = std::static_pointer_cast<TWrittenPortionInfo>(portionImpl);
 
     AFL_VERIFY(!InsertedPortions.contains(writtenPortion->GetInsertWriteId()));
+    ApplyTruncateSnapshots(*writtenPortion, snapshot);
     writtenPortion->SetCommitSnapshot(snapshot);
     TDbWrapper wrapper(txc.DB, nullptr);
     portion.SaveToDatabase(wrapper, firstPKColumnId, false);

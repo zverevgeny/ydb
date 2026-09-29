@@ -229,10 +229,6 @@ TTxController::TProposeResult TSchemaTransactionOperator::DoStartProposeOnExecut
             break;
         }
         case NKikimrTxColumnShard::TSchemaTxBody::kTruncateTable: {
-            if (!owner.TablesManager.IsGenerateInternalPathId()) {
-                return TProposeResult(
-                    NKikimrTxColumnShard::EResultStatus::SCHEMA_ERROR, "Cannot truncate column table without GenerateInternalPathId");
-            }
             if (owner.TablesManager.IsStoreTablet()) {
                 return TProposeResult(
                     NKikimrTxColumnShard::EResultStatus::SCHEMA_ERROR, "TRUNCATE is not supported for tables in a table store");

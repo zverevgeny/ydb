@@ -237,9 +237,13 @@ public:
         return TabletId;
     }
 
+    void RegisterTruncateSnapshot(TInternalPathId pathId, const TSnapshot& snapshot);
+
     void AddCleanupPortion(const TPortionInfo::TConstPtr& info) {
-        AFL_VERIFY(info->HasRemoveSnapshot());
-        CleanupPortions[info->GetRemoveSnapshotVerified().GetPlanInstant()].emplace_back(info);
+        AFL_VERIFY(info->HasCleanupSnapshot());
+        if (CleanupPortionIds.emplace(info->GetPortionId()).second) {
+            CleanupPortions[info->GetCleanupSnapshot().GetPlanInstant()].emplace_back(info);
+        }
     }
 
     void AddShardingInfo(const TGranuleShardingInfo& shardingInfo) {
@@ -264,6 +268,7 @@ public:
 private:
     ui64 TabletId;
     std::map<TInstant, std::vector<TPortionInfo::TConstPtr>> CleanupPortions;
+    THashSet<ui64> CleanupPortionIds;
     std::shared_ptr<NColumnShard::TPortionIndexStats> Counters;
     ui64 LastPortion;
     ui64 LastGranule;

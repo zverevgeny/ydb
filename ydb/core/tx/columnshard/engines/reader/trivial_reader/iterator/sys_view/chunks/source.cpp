@@ -183,7 +183,7 @@ std::shared_ptr<arrow::Array> TSourceData::BuildArrayAccessor(const ui64 columnI
         return NArrow::FinishBuilder(std::move(builder));
     }
     if (columnId == NKikimr::NSysView::Schema::PrimaryIndexStats::Activity::ColumnId) {
-        if (Portion->HasRemoveSnapshot()) {
+        if (Portion->HasCleanupSnapshot()) {
             return NArrow::TStatusValidator::GetValid(arrow::MakeArrayFromScalar(arrow::UInt8Scalar(0), recordsCount));
         } else {
             return NArrow::TStatusValidator::GetValid(arrow::MakeArrayFromScalar(arrow::UInt8Scalar(1), recordsCount));

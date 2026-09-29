@@ -6,6 +6,25 @@
 
 namespace NKikimr::NColumnShard {
 
+void TOperationsManager::BreakLocksForTable(const TUnifiedPathId& pathId) {
+    for (auto& [_, lock] : LockFeatures) {
+        for (const auto& operation : lock.GetWriteOperations()) {
+            if (operation->GetPathId().InternalPathId == pathId.InternalPathId &&
+                operation->GetPathId().GetSchemeShardLocalPathId() == pathId.GetSchemeShardLocalPathId()) {
+                lock.SetBroken();
+                break;
+            }
+        }
+        for (const auto& event : lock.GetEvents()) {
+            if (event->GetPathId().InternalPathId == pathId.InternalPathId &&
+                event->GetPathId().GetSchemeShardLocalPathId() == pathId.GetSchemeShardLocalPathId()) {
+                lock.SetBroken();
+                break;
+            }
+        }
+    }
+}
+
 void TLockFeatures::SetTxId(const ui64 txId) {
     AFL_VERIFY(!TxId || TxId == txId)("tx_id", txId)("lock_id", GetLockId())("tx_id_assigned", TxId);
     TxId = txId;

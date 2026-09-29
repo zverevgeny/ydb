@@ -480,6 +480,9 @@ void TColumnShard::RunTruncateTable(
 
     const auto schemeShardLocalPathId = TSchemeShardLocalPathId::FromProto(truncateProto);
     TablesManager.TruncateTableProgress(schemeShardLocalPathId, version, db);
+    const auto pathId = TablesManager.ResolveInternalPathId(schemeShardLocalPathId, false);
+    AFL_VERIFY(pathId);
+    OperationsManager->BreakLocksForTable(TUnifiedPathId::BuildValid(*pathId, schemeShardLocalPathId));
 }
 
 void TColumnShard::RunAlterStore(

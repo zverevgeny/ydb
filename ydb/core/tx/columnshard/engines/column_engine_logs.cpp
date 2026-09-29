@@ -413,7 +413,7 @@ bool TColumnEngineForLogs::FinishLoading() {
     for (const auto& [pathId, spg] : GranulesStorage->GetTables()) {
         for (const auto& [_, portionInfo] : spg->GetPortions()) {
             Counters->AddPortion(*portionInfo);
-            if (portionInfo->HasRemoveSnapshot()) {
+            if (portionInfo->HasCleanupSnapshot()) {
                 AddCleanupPortion(portionInfo);
             }
         }
@@ -584,6 +584,7 @@ std::shared_ptr<TCleanupPortionsColumnEngineChanges> TColumnEngineForLogs::Start
                 break;
             }
             changes->AddPortionToDrop(portion);
+            AFL_VERIFY(CleanupPortionIds.erase(portion->GetPortionId()));
             if (i + 1 < portions.size()) {
                 portions[i] = std::move(portions.back());
             }
@@ -609,7 +610,7 @@ std::shared_ptr<TCleanupPortionsColumnEngineChanges> TColumnEngineForLogs::Start
                 continue;
             }
             for (auto& [portion, info] : g->GetPortions()) {
-                if (info->HasRemoveSnapshot()) {
+                if (info->HasCleanupSnapshot()) {
                     continue;
                 }
                 if (dataLocksManager->IsLocked(*info, NDataLocks::ELockCategory::Cleanup)) {
@@ -736,14 +737,30 @@ bool TColumnEngineForLogs::ApplyChangesOnExecute(
     return true;
 }
 
+void TColumnEngineForLogs::RegisterTruncateSnapshot(const TInternalPathId pathId, const TSnapshot& snapshot) {
+    auto granule = GetGranulePtrVerified(pathId);
+    if (!granule->AddTruncateSnapshot(snapshot)) {
+        return;
+    }
+    for (const auto& [_, portion] : granule->GetPortions()) {
+        ModifyPortionOnComplete(portion, [&](const std::shared_ptr<TPortionInfo>& info) {
+            granule->ApplyTruncateSnapshots(*info);
+        });
+        if (portion->HasCleanupSnapshot()) {
+            AddCleanupPortion(portion);
+        }
+    }
+}
+
 void TColumnEngineForLogs::AppendPortion(const std::shared_ptr<TPortionInfo>& portionInfo) {
     TInstant appendPortionStart = TAppData::TimeProvider->Now();
     AFL_VERIFY(portionInfo);
     auto granule = GetGranulePtrVerified(portionInfo->GetPathId());
     AFL_VERIFY(!granule->GetPortionOptional(portionInfo->GetPortionId()));
+    granule->ApplyTruncateSnapshots(*portionInfo);
     Counters->AddPortion(*portionInfo);
     granule->AppendPortion(portionInfo);
-    if (portionInfo->HasRemoveSnapshot()) {
+    if (portionInfo->HasCleanupSnapshot()) {
         AddCleanupPortion(portionInfo);
     }
     SignalCounters.OnPortionAdded((TAppData::TimeProvider->Now() - appendPortionStart));
@@ -753,9 +770,10 @@ void TColumnEngineForLogs::AppendPortion(const std::shared_ptr<TPortionDataAcces
     TInstant appendPortionStart = TAppData::TimeProvider->Now();
     auto granule = GetGranulePtrVerified(portionInfo->GetPortionInfo().GetPathId());
     AFL_VERIFY(!granule->GetPortionOptional(portionInfo->GetPortionInfo().GetPortionId()));
+    granule->ApplyTruncateSnapshots(*portionInfo->MutablePortionInfoPtr());
     Counters->AddPortion(portionInfo->GetPortionInfo());
     granule->AppendPortion(portionInfo);
-    if (portionInfo->GetPortionInfo().HasRemoveSnapshot()) {
+    if (portionInfo->GetPortionInfo().HasCleanupSnapshot()) {
         AddCleanupPortion(portionInfo->GetPortionInfoPtr());
     }
     SignalCounters.OnPortionAdded((TAppData::TimeProvider->Now() - appendPortionStart));

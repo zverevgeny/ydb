@@ -64,6 +64,9 @@ TString TPortionInfo::DebugString(const bool withDetails) const {
     if (HasRemoveSnapshot()) {
         sb << "remove_snapshot:(" << RemoveSnapshot.Get().DebugString() << ");";
     }
+    if (TruncateSnapshot.Has()) {
+        sb << "truncate_snapshot:(" << TruncateSnapshot.Get().DebugString() << ");";
+    }
     return sb << ")";
 }
 
@@ -79,11 +82,15 @@ void TPortionInfo::SerializeToProto(const std::vector<TUnifiedBlobId>& blobIds, 
     PathId.ToProto(proto);
     proto.SetPortionId(PortionId);
     proto.SetSchemaVersion(GetSchemaVersionVerified());
-    if (HasRemoveSnapshot()) {
-        *proto.MutableRemoveSnapshot() = RemoveSnapshot.Get().SerializeToProto();
+    // The receiver may not have this table's truncate history. Materialize the
+    // effective boundary when transferring a portion.
+    if (HasCleanupSnapshot()) {
+        *proto.MutableRemoveSnapshot() = GetCleanupSnapshot().SerializeToProto();
     }
 
-    *proto.MutableMeta() = Meta.SerializeToProto(blobIds, GetProduced());
+    // Removal is serialized separately; the metadata describes the original portion type.
+    const auto produced = GetPortionType() == EPortionType::Compacted ? NPortion::EProduced::SPLIT_COMPACTED : NPortion::EProduced::INSERTED;
+    *proto.MutableMeta() = Meta.SerializeToProto(blobIds, produced);
 }
 
 TConclusionStatus TPortionInfo::DeserializeFromProto(const NKikimrColumnShardDataSharingProto::TPortionInfo& proto) {

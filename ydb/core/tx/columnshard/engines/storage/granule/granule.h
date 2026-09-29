@@ -138,6 +138,8 @@ private:
 
     mutable bool AllowInsertionFlag = false;
     const TInternalPathId PathId;
+    std::set<TSnapshot> TruncateSnapshots;
+    bool TruncatePending = false;
     std::shared_ptr<NDataAccessorControl::IDataAccessorsManager> DataAccessorsManager;
     const NColumnShard::TGranuleDataCounters Counters;
     NColumnShard::TEngineLogsCounters::TPortionsInfoGuard PortionInfoGuard;
@@ -173,6 +175,21 @@ private:
     bool DataAccessorConstructed = false;
 
 public:
+    void SetTruncatePending(const bool pending) {
+        TruncatePending = pending;
+    }
+
+    const std::set<TSnapshot>& GetTruncateSnapshots() const {
+        return TruncateSnapshots;
+    }
+
+    bool AddTruncateSnapshot(const TSnapshot& snapshot) {
+        return TruncateSnapshots.emplace(snapshot).second;
+    }
+
+    void ApplyTruncateSnapshots(TPortionInfo& portion) const;
+    void ApplyTruncateSnapshots(TPortionInfo& portion, const TSnapshot& commitSnapshot) const;
+
     std::vector<TCSMetadataRequest> CollectMetadataRequests() {
         return ActualizationIndex->CollectMetadataRequests(Portions);
     }
@@ -346,7 +363,9 @@ public:
     const TGranuleAdditiveSummary& GetAdditiveSummary() const;
 
     NStorageOptimizer::TOptimizationPriority GetCompactionPriority() const {
-        return OptimizerPlanner->GetUsefulMetric();
+        // Writes accepted before propose may finish on either side of the plan
+        // snapshot. Do not merge them until the truncate boundary is known.
+        return TruncatePending ? NStorageOptimizer::TOptimizationPriority::Zero() : OptimizerPlanner->GetUsefulMetric();
     }
 
     void ActualizeOptimizer(const TInstant currentInstant, const TDuration recalcLag) const {

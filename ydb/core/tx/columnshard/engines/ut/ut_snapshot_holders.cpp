@@ -1,5 +1,6 @@
 #include "test_path_id_translator.h"
 
+#include <ydb/core/tx/columnshard/data_sharing/protos/data.pb.h>
 #include <ydb/core/tx/columnshard/engines/snapshot_holders.h>
 #include <ydb/core/tx/columnshard/test_helper/portion_test_helper.h>
 #include <ydb/core/tx/long_tx_service/public/snapshot_registry.h>
@@ -37,6 +38,40 @@ Y_UNIT_TEST_SUITE(TSnapshotHoldersTests) {
             registryBuilder->AddSnapshot({ tableId }, snapshot);
         }
         return TTrueAtomicSharedPtr<IImmutableSnapshotRegistry>(std::move(*registryBuilder).Build().release());
+    }
+
+    Y_UNIT_TEST(TruncateVisibilityAndSnapshotRetention) {
+        const auto pathId = NColumnShard::TInternalPathId::FromRawValue(1);
+        auto portion = NTest::MakeTestCompactedPortion(pathId, 1, 0, 9, 10, Step(1), std::nullopt);
+        portion->SetTruncateSnapshot(Step(10));
+
+        UNIT_ASSERT(!portion->HasRemoveSnapshot());
+        UNIT_ASSERT(portion->HasCleanupSnapshot());
+        UNIT_ASSERT_VALUES_EQUAL(portion->GetCleanupSnapshot(), Step(10));
+        UNIT_ASSERT(portion->IsVisible(Step(9)));
+        UNIT_ASSERT(!portion->IsVisible(Step(10)));
+        UNIT_ASSERT(!portion->MayGetForScanAt(Step(10)));
+        UNIT_ASSERT(TSnapshotHoldersPerTable(Step(9), {}).CouldUsePortion(portion));
+        UNIT_ASSERT(TSnapshotHoldersPerTable(Step(20), { Step(5) }).CouldUsePortion(portion));
+        UNIT_ASSERT(!TSnapshotHoldersPerTable(Step(20), { Step(15) }).CouldUsePortion(portion));
+        UNIT_ASSERT(!TSnapshotHoldersPerTable(Step(20), {}).CouldUsePortion(portion));
+
+        NKikimrColumnShardDataSharingProto::TPortionInfo proto;
+        portion->SerializeToProto({ TUnifiedBlobId(1, TLogoBlobID(1, 1, 1, 1, 100, 0)) }, proto);
+        UNIT_ASSERT(proto.HasRemoveSnapshot());
+        UNIT_ASSERT_VALUES_EQUAL(proto.GetRemoveSnapshot().GetPlanStep(), 10);
+        UNIT_ASSERT_VALUES_EQUAL(proto.GetRemoveSnapshot().GetTxId(), 1);
+
+        // A compaction that was already running can still retire its input later.
+        portion->SetRemoveSnapshot(Step(15));
+        UNIT_ASSERT_VALUES_EQUAL(portion->GetCleanupSnapshot(), Step(10));
+        UNIT_ASSERT(portion->IsVisible(Step(9)));
+        UNIT_ASSERT(!portion->IsVisible(Step(12)));
+
+        auto removedEarlier = NTest::MakeTestCompactedPortion(pathId, 2, 0, 9, 10, Step(1), Step(5));
+        removedEarlier->SetTruncateSnapshot(Step(10));
+        UNIT_ASSERT_VALUES_EQUAL(removedEarlier->GetCleanupSnapshot(), Step(5));
+        UNIT_ASSERT(!removedEarlier->IsVisible(Step(5)));
     }
 
     Y_UNIT_TEST(PortionsCouldBeUsedAfterMinReadSnapshot) {
