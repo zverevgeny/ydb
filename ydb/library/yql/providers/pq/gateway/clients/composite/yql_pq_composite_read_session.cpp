@@ -689,24 +689,17 @@ public:
             return std::nullopt;
         }
 
-        // A ready WaitEvent can be a commit acknowledgement. The adapter drops it, so
-        // GetEvents is empty even though the SDK event was consumed. Keep scanning.
-        while (true) {
-            auto maybeEvent = ReadEventFromReadyPartitions(settings);
-            if (maybeEvent) {
-                RefreshReadyPartitions();
-                SRC_LOG_AS_T("GetEvent, suspended partitions #" << SuspendedPartitions.size() << ", ready partitions #" << ReadyPartitions.size() << ", pending partitions #" << PendingPartitions.size() << ", idle partitions #" << IdlePartitions.size());
-                return maybeEvent;
-            }
-
-            if (ReadyPartitions.empty()) {
-                RefreshReadyPartitions();
-                if (ReadyPartitions.empty()) {
-                    SRC_LOG_AS_T("GetEvent, suspended partitions #" << SuspendedPartitions.size() << ", ready partitions #" << ReadyPartitions.size() << ", pending partitions #" << PendingPartitions.size() << ", idle partitions #" << IdlePartitions.size());
-                    return std::nullopt;
-                }
+        RefreshReadyPartitions();
+        // Bound the scan by the current number of ready partitions. Empty reads can
+        // race with new arrivals or leave an oversized event queued; rotate to the
+        // next partition instead of asserting or retrying without a bound.
+        const size_t attempts = ReadyPartitions.size();
+        for (size_t attempt = 0; attempt < attempts; ++attempt) {
+            if (auto event = ReadEventFromReadyPartitions(settings)) {
+                return event;
             }
         }
+        return std::nullopt;
     }
 
     NThreading::TFuture<void> Close() final {
@@ -909,17 +902,6 @@ private:
 
         const auto key = *NextReadyPartition;
         auto event = key->GetEvent(settings);
-        if (!event) {
-            // An acknowledgement was the only queued event: the adapter consumed it and
-            // the SDK queue is empty. A still-ready WaitEvent means the next event did
-            // not fit MaxByteSize and is still queued.
-            Y_VALIDATE(!key->WaitEvent().IsReady(), "Unexpected empty event for ready partition");
-            NextReadyPartition = ReadyPartitions.erase(NextReadyPartition);
-            DistributePartitionSession(key);
-            UpdateMetrics();
-            return std::nullopt;
-        }
-
         if (!key->WaitEvent().IsReady()) {
             // There are no ready events in this partition, so move it to pending / idle
             NextReadyPartition = ReadyPartitions.erase(NextReadyPartition);
@@ -927,6 +909,11 @@ private:
         } else {
             // Move to next partition
             NextReadyPartition++;
+        }
+
+        if (!event) {
+            UpdateMetrics();
+            return std::nullopt;
         }
 
         if (!key->GetReadTime()) {

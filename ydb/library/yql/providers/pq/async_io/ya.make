@@ -12,6 +12,7 @@ SRCS(
 )
 
 PEERDIR(
+    library/cpp/containers/disjoint_interval_tree
     library/cpp/protobuf/interop
     library/cpp/retry
     ydb/core/fq/libs/graph_params/proto

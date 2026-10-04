@@ -36,6 +36,7 @@
 #include <yql/essentials/utils/log/log.h>
 #include <yql/essentials/utils/yql_panic.h>
 
+#include <library/cpp/containers/disjoint_interval_tree/disjoint_interval_tree.h>
 #include <library/cpp/lwtrace/mon/mon_lwtrace.h>
 #include <library/cpp/protobuf/interop/cast.h>
 
@@ -1187,23 +1188,27 @@ private:
     IFederatedTopicClient::TPtr FederatedTopicClient;
     std::vector<TClusterState> Clusters;
     struct TStreamDeferredCommit {
-        struct TRange {
-            std::shared_ptr<NFq::IMessageStreamPartitionControl> Partition;
-            ui64 Start = 0;
-            ui64 End = 0;
-        };
+        using TPartitionControl = std::shared_ptr<NFq::IMessageStreamPartitionControl>;
 
-        void Add(std::shared_ptr<NFq::IMessageStreamPartitionControl> partition, ui64 start, ui64 end) {
-            Ranges.push_back({std::move(partition), start, end});
+        void Add(TPartitionControl partition, ui64 start, ui64 end) {
+            Y_ENSURE(partition);
+            Y_ENSURE(start < end, "Empty or reversed commit interval");
+            auto& ranges = Ranges[std::move(partition)];
+            Y_ENSURE(!ranges.Intersects(start, end), "Overlapping commit intervals");
+            ranges.InsertInterval(start, end);
         }
 
         void Commit() {
-            for (const auto& range : Ranges) {
-                range.Partition->Commit(range.Start, range.End);
+            for (const auto& [partition, ranges] : Ranges) {
+                for (const auto& [start, end] : ranges) {
+                    partition->Commit(start, end);
+                }
             }
+            Ranges.clear();
         }
 
-        std::vector<TRange> Ranges;
+        // Keep different partition sessions separate, even for the same partition ID.
+        std::map<TPartitionControl, TDisjointIntervalTree<ui64>, std::owner_less<TPartitionControl>> Ranges;
     };
 
     std::queue<std::pair<ui64, TStreamDeferredCommit>> DeferredCommits;

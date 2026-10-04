@@ -255,24 +255,22 @@ public:
         }
         result.reserve(std::min(limit, size_t{16}));
 
-        // Commit acknowledgements are not part of the common event API. Skip them and
-        // keep pulling while the SDK queue still has events. Stop when the queue is
-        // empty or the next event does not fit MaxByteSize: that call returns nothing
-        // and leaves WaitEvent ready.
+        // Retry only batches consisting entirely of filtered acknowledgements.
+        // Returning the first useful batch preserves the SDK byte budget and avoids
+        // repeatedly reading a terminal event that the SDK leaves in its queue.
         bool block = settings.Block;
-        while (result.size() < limit) {
-            auto events = Session->GetEvents(block, limit - result.size(), settings.MaxByteSize);
+        while (true) {
+            auto events = Session->GetEvents(block, limit, settings.MaxByteSize);
             block = false;
             if (events.empty()) {
                 break;
             }
-            const size_t convertedBefore = result.size();
             for (auto& event : events) {
                 if (auto converted = ConvertEvent(std::move(event))) {
                     result.push_back(std::move(*converted));
                 }
             }
-            if (result.size() == convertedBefore && !Session->WaitEvent().IsReady()) {
+            if (!result.empty()) {
                 break;
             }
         }

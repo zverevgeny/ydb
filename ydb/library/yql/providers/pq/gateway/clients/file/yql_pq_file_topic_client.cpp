@@ -62,7 +62,12 @@ public:
         Y_UNUSED(maxByteSize);
 
         std::vector<TReadSessionEvent::TEvent> res;
-        for (auto event = EventsQ.Pop(block); event.has_value() && res.size() < maxEventsCount.value_or(std::numeric_limits<size_t>::max()); event = EventsQ.Pop(/* block */ false)) {
+        while (res.size() < maxEventsCount.value_or(std::numeric_limits<size_t>::max())) {
+            auto event = EventsQ.Pop(block);
+            block = false;
+            if (!event) {
+                break;
+            }
             res.push_back(std::move(*event));
         }
 
@@ -237,7 +242,12 @@ public:
 
     std::vector<TWriteSessionEvent::TEvent> GetEvents(bool block, std::optional<size_t> maxEventsCount) final {
         std::vector<TWriteSessionEvent::TEvent> res;
-        for (auto event = EventsQ.Pop(block); event.has_value() && res.size() < maxEventsCount.value_or(std::numeric_limits<size_t>::max()); event = EventsQ.Pop(/* block */ false)) {
+        while (res.size() < maxEventsCount.value_or(std::numeric_limits<size_t>::max())) {
+            auto event = EventsQ.Pop(block);
+            block = false;
+            if (!event) {
+                break;
+            }
             res.push_back(std::move(*event));
         }
 
